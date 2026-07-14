@@ -1,16 +1,15 @@
-# Architecture — LOCKED 2026-07-14
+# Architecture — LOCKED 2026-07-14 (rev 2: after SR-head investigation)
 
 ## TL;DR
 
-We don't build from scratch. We **port NVIDIA PiD v1.5 (qwenimage) from 2D image to 3D video**.
+NVIDIA's "qwenimage" PiD is **2D image-only**, with a "4× SR" naming convention for the LDM-vs-pixel ratio, **not a learned upsample**. To use it for video decoding we must:
 
-NVIDIA has already trained PiD on a VAE that is byte-for-byte identical to Wan 2.1's VAE (16 channels, 8× spatial compression, identical `latents_mean`/`latents_std`). The 2.80 GB bf16 EMA checkpoint is on HF at:
+1. **Subclass `PixDiT_T2I`** (not `PidNet`), drop `LQProjection2D` entirely or replace with a 1×-video-specific conditioning head
+2. **Inflate Conv2d→Conv3d** in `pixel_embedder` and `final_layer` (per-pixel linears; weights are `(16, 3)` and `(3, 16)`)
+3. **Add a real 3D attention path** (temporal attention block in `pixel_blocks`); NVIDIA's released model is 2D-attention only — the "video" support in their code is a parameter name, not real infrastructure
+4. **Don't init from the released 2.8GB qwenimage EMA** — it's distilled at 4-step Euler with σ_max=0.8 and RoPE tuned to 2048². Misfires on identical-resolution LQ+HQ. Either (a) init from the per-pixel 2D modules only (`pixel_embedder`, `final_layer`, `s_embedder.proj`) and train the rest, or (b) train a fresh 1× variant (2-3 days on 8×H100) then finetune on video.
 
-```
-nvidia/PiD :: checkpoints/PiD_v1pt5_res2kto4k_sr4x_official_qwenimage_distill_4step/model_ema_bf16.pth
-```
-
-The port = inflate Conv2d→Conv3d in the LQ projection (9 layers), generalize RoPE to 3D, add a temporal attention block, fine-tune on video. NVIDIA's own `lq_video_or_image` parameter is plumbed through 21+ call sites in `pid_distill_model.py` waiting for 5D tensors.
+The Qwen-Image VAE = Wan 2.1 VAE identity is still valid (16ch, 8× spatial, byte-identical mean/std). We use it for LQ conditioning. The 2.8GB EMA is **not** the right init for our use case.
 
 ## Wan 2.1 1.3B numbers (verified by source inspection)
 
@@ -22,22 +21,48 @@ The port = inflate Conv2d→Conv3d in the LQ projection (9 layers), generalize R
 - **Latent shape for 16f@480×832:** `(16, 4, 60, 104)` — 16 ch × 4 temporal × 60 × 104 spatial = 39,936 latent values
 - **DiT seq_len for 16f@480×832:** `math.ceil((60*104)/(2*2) * 4)` = 15,600 tokens (Wan patch 1,2,2)
 
-## Spec (video-PiD)
+## Spec (video-PiD v2)
 
 | Component | Choice | Source |
 |---|---|---|
-| Backbone | PixelDiT-SR v1.5 (1B params, ~120M trainable in LQ-proj-only mode) | NVIDIA PiD v1.5 qwenimage checkpoint |
-| Input projection | LQ projection: Conv3d (inflated from Conv2d, 9 layers) | NVIDIA `pid/_src/networks/lq_projection_2d.py` |
-| Patch embed | `Conv3d(3, dim, kernel=(2,8,8), stride=(2,8,8))` | Architecture spec |
-| Pixel tokens (16f×480×832) | `8 × 60 × 104 = 49,920 tokens` | kernel (2,8,8) stride (2,8,8) on (T=16, H=480, W=832) → (8, 60, 104) |
-| Attention | Sliding Tile Attention (tile ~ T=4, H=8, W=8), fallback factorised T-then-S | arXiv 2502.04507 |
-| Conditioning | Sigma-aware adapter (LQ + noise-corrupted latent + σ → AdaLN) | NVIDIA PiD paper |
+| Backbone | Subclass `PixDiT_T2I` from `pid/_src/networks/pixeldit_official.py:1123` | NVIDIA PiD code (subagent 6 finding) |
+| Skip | `PidNet` and `LQProjection2D` entirely | Strip the 4x-specific controlnet pathway |
+| Patch embed | `Conv3d(3, 16, kernel=1, stride=1)` (per-pixel Linear → per-pixel Conv3d, init by replication over T) | `pixel_embedder.proj.weight = (16, 3)` per-pixel |
+| Output | `Conv3d(16, 3, kernel=1, stride=1)` (per-pixel final_layer → per-pixel Conv3d, init by replication) | `final_layer.linear.weight = (3, 16)` per-pixel |
+| 2D attention blocks | `patch_blocks`: 14× MMDiT 2D attention, kept as-is | `pixel_blocks` (per-pixel, no temporal) |
+| Temporal attention | **NEW: add 2-3 temporal-attention blocks in `pixel_blocks`**, factorised T-then-S like AnimateDiff | Not in NVIDIA model; we add |
+| Conditioning | `lq_latent` conditioning via our own thin Conv3d head (drop the 7-gate controlnet path) | We replace NVIDIA's LQProjection2D |
+| RoPE | 3D RoPE on (T, H, W), per-pixel (not patch-based) | Per-pixel DiT uses no RoPE — our 3D add needs new RoPE |
+| Timestep | AdaLN, per-pixel | PiD v1.5 |
 | Output | Residual: `final = Wan_decode + Δ` | ResShift, SinSR, ImpRes |
-| RoPE | 3D RoPE on (T, H, W), inflated from NVIDIA's 2D RoPE | Standard |
-| Timestep | AdaLN | PiD v1.5 |
-| Sampler | 4-step EDM (PiD default); distill to 2 later via CausVid | NVIDIA PiD |
-| VRAM @ 3090 | ~14GB train (LQ-proj-only, batch 1, grad-accum 8, bf16) | Architecture subagent |
-| VRAM @ 3090 inference | ~2GB (PiD only, Wan + VAE on GPU) | TBD |
+| Sampler | 4-step EDM, then distill to 2 later | We train a fresh 1× variant |
+| Init strategy | Per-pixel 2D modules: from released EMA. All else: train from scratch | Because the EMA is 4x-trained and will misfire at 1x |
+| VRAM @ 3090 train | ~16-18GB (model ~2GB, activations + STA with ckpt ~10GB, grads/optim ~4GB) | Architecture subagent |
+| VRAM @ 3090 inference | ~2GB (PiD only, Wan + VAE on GPU, T5 on CPU) | TBD |
+
+## Init strategy (critical)
+
+The released 2.8GB EMA is **trained for the 4× SR pathway** (zero-init gate heads, RoPE tuned to 2048², σ_max=0.8). We can use it for **per-pixel 2D components only**:
+
+```
+USE FROM RELEASED EMA (per-pixel 2D, verified shapes):
+  - pixel_embedder.proj.weight: (16, 3)        → inflate to (16, 3, T_kernel)
+  - pixel_embedder.proj.bias:   (16,)          → broadcast to (16,)
+  - final_layer.linear.weight:  (3, 16)        → inflate to (3, 16, T_kernel)
+  - final_layer.linear.bias:    (3,)           → broadcast to (3,)
+  - final_layer.norm.weight:    (16,)          → broadcast to (16,)
+  - s_embedder.proj.weight:     (1536, 768)    → per-pixel, no inflation needed
+  - s_embedder.proj.bias:       (1536,)
+
+INIT FROM SCRATCH (everything else):
+  - All 14 patch_blocks: from scratch
+  - All 2 pixel_blocks: from scratch
+  - New temporal attention blocks: from scratch
+  - New LQ-conditioning head: from scratch
+  - New 3D RoPE: from scratch
+```
+
+The per-pixel Conv3d weights are inflated by **replicating the 2D kernel across the T axis with small Gaussian noise** (so the model isn't initially a strict temporal-mean). This is the standard 2D→3D inflation trick.
 
 ## Hook point (where video-PiD plugs in)
 
@@ -63,35 +88,38 @@ We subclass `WanPipeline` and override the `__call__` method to insert the video
 
 ## Why this works
 
-1. **The base is right.** Qwen-Image VAE = Wan 2.1 VAE (16ch, 8×8, byte-identical mean/std). NVIDIA's PiD learns the exact latent→pixel mapping we need.
-2. **The init is free.** 2.8GB checkpoint, downloads in seconds. No training-from-scratch.
-3. **The video path is plumbed.** `lq_video_or_image=None` is in 21+ call sites. The API is ready.
-4. **Fits 3090.** Wan 1.3B + T5-CPU + video-PiD = ~9GB. Comfortable.
+1. **The base is right.** Qwen-Image VAE = Wan 2.1 VAE (16ch, 8×8, byte-identical mean/std). NVIDIA's per-pixel 2D modules are a valid init for the patch embed / final layer.
+2. **The math is sound.** Per-pixel DiT + Conv3d inflation + temporal attention is a known recipe (AnimateDiff, Wan 2.1 itself uses 3D RoPE + factorised attention).
+3. **Fits 3090.** Wan 1.3B + T5-CPU + video-PiD = ~9GB. Comfortable.
+4. **Training time is bounded.** Per-pixel DiT-S/2 is ~35M params. Trainable. ~2-3 days on the 3090.
 
 ## Code locations (NVIDIA repo, `nv-tlabs/PiD`)
 
-| What | Path | Lines |
-|---|---|---|
-| Main network | `pid/_src/models/pid_model.py` | 903 |
-| Distill model | `pid/_src/models/pid_distill_model.py` | 1904 |
-| LQ projection (Conv2d → inflate) | `pid/_src/networks/lq_projection_2d.py` | 637 |
-| PixelDiT backbone | `pid/_src/networks/pixeldit_official.py` | 1522 |
-| PixelDiT model | `pid/_src/models/pixeldit_model.py` | 879 |
-| Qwen-Image VAE (= Wan 2.1 VAE 2D) | `pid/_src/tokenizers/qwenimage_vae.py` | 532 |
-| Flow matching | `pid/_src/models/latent_noising.py` | 326 |
-| Discriminators (incl. VideoDiT) | `pid/_src/models/discriminators.py` | — |
-| Inference | `pid/_src/inference/from_ldm.py` | — |
-| Pipeline registry | `pid/_src/inference/pipeline_registry.py` | — |
+| What | Path | Lines | Action |
+|---|---|---|---|
+| PidNet entry (skip) | `pid/_src/networks/pid_net.py` | 560 | Don't subclass |
+| Pure T2I base | `pid/_src/networks/pixeldit_official.py:1123` (`PixDiT_T2I`) | 1522 | **Subclass this** |
+| pixel_embedder | `pid/_src/networks/pixeldit_official.py:340-442` | 100 | Inflate to 3D |
+| final_layer | `pid/_src/networks/pixeldit_official.py:340-349` | 10 | Inflate to 3D |
+| patch_blocks | `pid/_src/networks/pixeldit_official.py` | ~700 | Keep 2D, add temporal |
+| pixel_blocks | `pid/_src/models/pixeldit_model.py` | 879 | Keep 2D, add temporal |
+| LQ projection (skip) | `pid/_src/networks/lq_projection_2d.py` | 637 | Replace with thin Conv3d |
+| Qwen-Image VAE | `pid/_src/tokenizers/qwenimage_vae.py` | 532 | Use for LQ conditioning |
+| Flow matching | `pid/_src/models/latent_noising.py` | 326 | Use as-is |
+| Discriminators | `pid/_src/models/discriminators.py` | — | Use `Discriminator_VideoDiT` |
+| Inference | `pid/_src/inference/from_ldm.py` | 253 | Use as reference |
+| Architecture findings | `research/nvidia_pid_arch_findings.md` | 14 KB | Subagent 6 report |
 
 ## The port, concretely
 
-1. Vendor the 4 key NVIDIA files under `video_pid/nvidia/` (Apache 2.0 attribution in LICENSE/NOTICE)
-2. `lq_projection_2d.py` → `lq_projection_3d.py`: rename, change `Conv2d`→`Conv3d`, accept 5D `(B, C, T, H, W)`
-3. `pixeldit_official.py` → add temporal attention block (factorised T-then-S)
-4. RoPE: 2D→3D split (T/H/W)
-5. `lq_video_or_image`: now actually receives 5D video tensors
-6. `from_wan.py`: copy `from_ldm.py`, swap `QwenImagePipeline` → `WanPipeline`
-7. Init from `model_ema_bf16.pth` checkpoint, fine-tune on video clips
+1. Vendor the key NVIDIA files: `pixeldit_official.py`, `qwenimage_vae.py`, `latent_noising.py`, `discriminators.py`
+2. Write `video_pid/pix_dit_3d.py`: subclass `PixDiT_T2I`, inflate Conv2d→Conv3d in pixel_embedder/final_layer, add temporal attention to pixel_blocks
+3. Write `video_pid/lq_video_3d.py`: thin Conv3d LQ conditioning head (replaces NVIDIA's `LQProjection2D`)
+4. Write `video_pid/pid_3d_model.py`: the full model with init logic (load per-pixel 2D from EMA, init rest from scratch)
+5. Write `video_pid/pipeline.py`: subclass `WanPipeline`, hook at lines 667-668
+6. Write training script with Wan-VAE round-trip LQ corruption
+7. Write CLI scripts: generate_baseline, generate_with_pid
+8. Smoke test: load model, forward pass, save before/after video
 
 ## References
 
@@ -100,6 +128,7 @@ We subclass `WanPipeline` and override the `__call__` method to insert the video
 - NVIDIA PiD HF: https://huggingface.co/nvidia/PiD
 - Sliding Tile Attention: arXiv 2502.04507
 - Wan 2.1: https://github.com/Wan-Video/Wan2.1
-- Hook design doc: `research/wan21_hook_design.md`
+- Architecture findings: `research/nvidia_pid_arch_findings.md`
 - Architecture spec: `research/architecture_spec.md`
 - Training recipe: `research/training_recipe.md`
+- Hook design: `research/wan21_hook_design.md`
