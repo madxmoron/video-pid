@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "Video-PiD: Pixel-Space Decoder for Wan 2.1"
+version: 0.0.1
+date-released: 2026-07-14
+license: Apache-2.0
+authors:
+  - family-names: madxmoron
+    given-names: madxmoron
+repository-code: "https://github.com/madxmoron/video-pid"
+url: "https://huggingface.co/madxmoron/video-pid"
+keywords:
+  - diffusion
+  - video
+  - vae
+  - decoder
+  - wan
+  - pixel-space
+references:
+  - type: article
+    title: "PiD: Fast and High-Resolution Latent Decoding with Pixel Diffusion"
+    year: 2026
+    authors:
+      - family-names: NVIDIA
+        given-names: SIL
+    eprint: "2605.23902"
+    url: "https://research.nvidia.com/labs/sil/projects/pid/"

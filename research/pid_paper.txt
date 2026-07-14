@@ -1,0 +1,965 @@
+
+
+===== PAGE 1 =====
+
+2026-5-25
+PiD: Fast and High-Resolution Latent Decoding with Pixel
+Diffusion
+Yifan Lu, Qi Wu, Jay Zhangjie Wu, Zian Wang, Huan Ling, Sanja Fidler, Xuanchi Ren
+NVIDIA
+https://research.nvidia.com/labs/sil/projects/pid/
+RAE Decode
+PiD Decode  
+(Real Image’s DINOv2 Latent)
+Low-Res    LatentVAE Dec.Upsampler DMVAE Dec.
+Conventional CascadedPipelineHigh-Res    ImagePiD: Decoding with Upsampling
+Latentof512!→Image of 2048!
+PiD Decode  
+(Real Image’s SD3 latent)
+VAE Decode
+PiD Decode
+(FLUX.1 [dev])
+VAE Decode
+PiD Decode  
+(Z Image)
+PiD Decode 
+(FLUX.2 [dev])
+VAE Decode
+VAE Decode
+Figure 1: PiDdirectlydecodes latents from VAE or vision encoders into higher-resolution images, replacing
+the decode–then–upsample cascade while achieving lower latency and higher visual quality.
+©2026 NVIDIA. All rights reserved.
+arXiv:2605.23902v1  [cs.CV]  22 May 2026
+
+===== PAGE 2 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+VAE Decoding(1024×1024)
+FLUX.1[dev]
+Prompt: A close portrait of a weathered
+fisherman’s face beside a perched seagull
+on his shoulder, gray ocean behind, soft
+overcast light, simple documentary-style
+composition.
+PiD Decoding(4096×4096)
+VAE Decoding(1024×1024)
+Z-Image
+Prompt: A cinematic rural scene where
+scarecrows gather at night for a secret
+orchestra concert in a cornfield, straw
+hands playing violins and brass, moonlit
+rows as aisles, crows sitting respectfully
+in the audience, conductor’s stand labeled
+“HARVEST SYMPHONY”, mist, fireflies,
+gentle spooky charm without horror, richly
+detailed realism.
+PiD Decoding(4096×4096)
+Figure 2:4K decoding results. PiD synthesize more details at 4k resolution.
+2
+
+===== PAGE 3 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+Abstract
+Most practical high-resolution text-to-image systems, including latent diffusion and autoregressive
+models, perform generation in a compact latent space, and a decoder maps the generated latents back
+to pixels. Yet the latent-to-pixel decoder is reconstruction-oriented, optimized to invert the encoder
+rather than synthesize more details, and becomes increasingly costly at megapixel scale. This drawback
+calls for a more expressive and efficient decoding paradigm. Motivated by recent progress in scalable
+pixel-space diffusion, we introduce PiD, a Pixel diffusion Decoder that reformulates latent decoding as
+conditional pixel diffusion, unifying decoding and upsampling into one generative module. By denoising
+directly in high-resolution pixel space, PiD synthesizes4× and even8× upscaled images with low latency.
+For latent conditioning, a lightweight sigma-aware adapter injects noise-corrupted latents into the pixel
+diffusion backbone, enabling PiD to decode partially denoised latents and terminate the latent diffusion
+process early. To further improve efficiency, we distill the model using DMD2, reducing inference to just
+4 steps. PiD applies to both conventional VAE latents and semantic latents (e.g., SigLIP, DINOv2) used
+in recent RAE-based models. PiD decodes latents of512×512 images into2048×2048 pixels in under1
+second with13 GB peak memory on a consumer RTX 5090, and as fast as210 ms on a GB200 GPU, about
+6×faster than cascaded diffusion-based super-resolution pipelines with better visual fidelity.
+1. Introduction
+Latent diffusion models (LDMs) have become the standard paradigm for text-to-image generation [30]. They
+denoise in a compact latent space, which is more computationally efficient and statistically easier than working
+in the pixel domain, followed by a decoder that maps the generated latent to pixels. Beyond diffusion models,
+modern autoregressive image generators [22, 34, 37, 56] also generate images through visual tokens that
+must ultimately be decoded back to pixels. As the only pathway from latent space back to image space, this
+latent-to-pixel interface is a key factor in final visual fidelity.
+Despiteitsimportance, thedecoderinLDMshasreceivedfarlessattentionthanthediffusionbackbone. Most
+pipelines adopt a convolutional variational autoencoder [18, 29] (VAE), but encoder–decoder reconstruction is
+never perfect, inevitably introducing some inherent losses of fine-grained details. Furthermore, since traditional
+VAE decoders are designed solely to recover stored information in latents, they tend to pass through or even
+amplify artifacts in the generated latents rather than correcting them. These limitations are particularly evident
+in representation autoencoders (RAEs) [65], where semantically rich latents preserve high-level structure but
+under-specify low-level appearance, requiring the decoder to synthesize missing texture—a capability that
+standard reconstruction-based decoders lack.
+Recent work has begun to treat decoding as a generative problem.𝜖-VAE [64] and SSDD [39] replace
+conventional VAE decoding with pixel-space denoising and distill it into fast single-step decoders. However,
+these approaches remain limited: they do not scale to high-resolution generation due to network architecture,
+remain dominated by reconstruction objectives, and still lack enough generative capacity to rectify latent-level
+artifacts or synthesize missing high-frequency details.
+At the same time, recent pixel-space diffusion models [21, 59] show the power of generating high-resolution
+images directly in pixel space, excelling at fine detail synthesis. This suggests a natural hybrid: use the sampled
+latent as a structural condition, and use a strong pixel-space diffusion model as the decoder-side generative
+prior. In this formulation, the latent preserves the base model’s global layout and semantics, while the pixel
+prior supplies the high-frequency appearance details that reconstruction-oriented decoders struggle to generate.
+In this work, we introducePiD, aPixel diffusionDecoder that reformulates latent decoding as conditional
+pixel diffusion. PiD unifies visual decoding and super-resolution in a single generative module. By directly
+denoising in target high-resolution image space, it generates4× or even8× higher-resolution images with low
+3
+
+===== PAGE 4 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+latency. To incorporate latent conditioning, we introduce a lightweight adapter that injects noise-corrupted
+latents into the pixel diffusion backbone through a sigma-aware gate. This noise-aware conditioning allows our
+diffusion decoder to handle both fully denoised and partially denoised latents. We further distill the model
+with DMD2 [52] technique, reducing inference to only4 denoising steps. This streamlined decoding strategy
+supersedes the conventional high-resolution cascade—low-resolution VAE decoding, super-resolution diffusion,
+and high-resolution VAE decoding—with lower latency, lower memory, and better visual fidelity.
+PiD decodes a latent corresponding to512×512 into a2048×2048 image in under1 second with13 GB peak
+memory on a consumer RTX 5090, and in210ms on a GB200 GPU, delivering superior speed and visual quality
+compared with the cascaded baseline. Additionally, PiD can consume partially denoised latents, enabling early
+termination of the base latent diffusion process. Beyond VAE latents, PiD generalizes to semantic latents such
+as DINOv2 features and is particularly well matched to RAE: where RAE latents retain strong semantics but
+underdetermine fine appearance, PiD supplies the missing generative capacity at decoding time. We further
+demonstrate that PiD can scale up to 4K resolution decoding while generating more fine-grained details.
+In summary, our contributions are as follows:
+• We introducePiD, a pixel diffusion decoder that reformulates latent decoding as conditional pixel generation,
+unifying decoding and high-resolution upsampling in a single diffusion decoding stage.
+• We propose a lightweight sigma-aware latent adapter with noisy latent condition training, allowing early
+termination of LDM models and decoding on partially denoised latents.
+• We show that PiD extends beyond VAE latents to semantic representations such as DINOv2 features, providing
+generative, high-resolution decoding capability for RAE-style diffusion models.
+• We demonstrate that PiD outperforms the conventional super-resolution pipeline in both latency and visual
+quality, decoding2048×2048 images in under1 second with13 GB peak memory on a consumer RTX 5090
+and in210ms on a GB200 GPU.
+2. Related Work
+Latent representations for image generation.Latent diffusion models [30] generate images in the latent
+space of an autoencoder, greatly reducing training and inference cost of the diffusion network. Most existing
+systems use reconstruction-oriented autoencoders, such as VAEs [18, 29], VQ-VAEs [40], and more recent
+tokenizer and autoencoder designs [8, 57, 58], further improving this paradigm by increasing compression
+efficiency and reconstruction fidelity. Beyond latent diffusion, autoregressive image generators including
+Parti [56], LlamaGen [34], VAR [37], and MAR [22] likewise model discrete or continuous visual latents
+produced by such autoencoders, and rely on the same autoencoder decoder to map the generated latents back
+to pixels. More recently, works such as VFM-VAE [4], RAE [65], and Scale-RAE [38] replace reconstruction-
+centric encoders with pretrained vision encoders such as DINOv2 [27] and SigLIP [62], producing semantically
+richer latent representations. These approaches shift the role of the latent space: reconstruction autoencoders
+emphasize pixel-level invertibility, whereas pretrained vision encoders preserve stronger semantic structure
+while under-specifying fine appearance. Across all of these settings, generated latents must ultimately be
+converted back to pixels through a decoder that is largely reconstruction-oriented. Our work is complementary
+to advances in latent representation learning: rather than designing a new latent space, we improve the
+latent-to-pixel interface through latent-conditioned generative decoding that applies to latents produced by
+either diffusion or autoregressive generators.
+Diffusion decoders.Several works replace conventional reconstruction decoders with generative diffusion
+processes in pixel space. DiVAE [32], 𝜖-VAE [64], and SSDD [39] formulate decoding as iterative denoising to
+improve reconstruction quality and downstream generation, while SSDD further distills diffusion decoding into
+a fast single-step model. DALL-E 3 [3] reports using a diffusion decoder on top of an LDM latent space, and
+Unified Latents [12] jointly optimizes the encoder, latent prior, and diffusion decoder. These works indicate
+4
+
+===== PAGE 5 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+diffusion models can serve as effective decoders, but they still remain primarily reconstruction-oriented: they
+focus on same-resolution decoding, are evaluated at relatively low resolutions, and remain tied to separate
+super-resolution stages in high-resolution pipelines. In contrast, PiD incorporates a pixel diffusion generative
+prior into the decoder and formulates decoding and upsampling as a single conditional generation task.
+High-resolution image synthesis.A widely used strategy for high-resolution image synthesis is cascaded
+super-resolution, which decomposes generation into a base model followed by one or more upsampling stages.
+Classical methods such as ESRGAN [44] and Real-ESRGAN [43] use adversarial and perceptual objectives for
+visually sharp outputs, while diffusion-based cascades [13, 23, 31, 42, 46, 55, 61] leverage large generative
+priors for higher-fidelity texture synthesis. Recent distilled variants [1, 10, 16, 35, 48, 53, 60] reduce sampling
+cost, and latent-space approaches such as LUA [28] and LSRNA [15] avoid intermediate pixel decoding.
+In parallel, recent work explores direct high-resolution generation. PixArt-Σ [9], SANA [49], and Ultra-
+Flux [51] improve scalable high-resolution synthesis through advances in training, architecture, and compres-
+sion. Recent pixel-space diffusion transformers such as JiT [21] and PixelDiT [59] further demonstrate that
+raw-pixel generation can scale to high resolutions while synthesizing fine-grained detail. In contrast, PiD unifies
+latent decoding and spatial upsampling within a single latent-conditioned pixel diffusion model, directly using
+a scalable pixel diffusion prior as the decoder.
+3. Pixel Diffusion Decoder
+We reformulate latent decoding as latent-conditioned pixel diffusion. Instead of first decoding a latent to
+a low-resolution image and then applying separate super-resolution stages, our model directly generates
+high-resolution images from sampled latents with a pixel-space text-to-image prior. This unifies latent decoding
+and spatial upsampling within a single generative process.
+3.1. Problem Formulation
+Let z∈R 𝐶×ℎ×𝑤 denote a sampled latent under text condition𝑐 in an autoencoder latent space, such as a VAE
+or representation autoencoder (RAE) latent space. Conventional latent diffusion pipelines first decode the
+latent into an imagexdec =𝒟(z)∈R 3×𝐻×𝑊 using a decoder𝒟, and then apply a separate upsampler𝒰𝑠 to
+produce higher-resolution outputs:
+ˆx0 =𝒰 𝑠(xdec)∈R 3×(𝑠𝐻)×(𝑠𝑊) ,(1)
+where 𝑠 >1 is the target upsampling factor. This formulation decomposes latent decoding and spatial
+upsampling into separate stages.
+In contrast, PiD directly models the target-resolution image distribution with conditional pixel diffusion:
+ˆx0∼𝑝 (𝑠)
+𝜃 (x0|z, 𝑐),x 0∈R 3×(𝑠𝐻)×(𝑠𝑊) .(2)
+In this work, we focus on high-resolution decoding with𝑠= 4 or 𝑠= 8 . The latent provides global structure
+and semantic hints, while the pixel diffusion prior synthesizes fine image detail directly at the target resolution.
+This replaces native reconstruction and decode-then-upsample cascades with a single conditional pixel-diffusion
+decoder.
+3.2. Latent-Conditioned Pixel Decoder
+Pixel-space generative prior.To provide strong generative capability for decoding and upsampling, we design
+PiD to build on top of a text-conditioned pixel diffusion prior. We adopt PixelDiT [59], a pixel-space diffusion
+transformer with an MMDiT-style [11] backbone, as our base architecture.
+Starting from a pretrained1024×1024 checkpoint, we further scale the model to 2K resolution and beyond.
+Scaling to these resolutions substantially increases the patch-token sequence length, so we replace the original
+5
+
+===== PAGE 6 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+Latent𝐶	×ℎ×𝑤noise (𝜎)interpolation
+DiTBlock1DiTBlock2DiTBlock3 PiTBlocksNoisy Image3	×	sH	×	sW
+GG
+…
+𝜎-aware gate𝜎 𝜎
+T2I Diffusion PriorVelocity3	×	𝑠𝐻	×	𝑠𝑊
+Noisy Latent   Resize & Encode
+Model ArchitectureInference w/ LDM Early Termination
+…Skip
+𝝈=1
+𝝈=0.75
+𝝈=0.5
+Flow Matching Loss𝜎-aware gate
+-Lower Latency- Higher Resolution- Generative
+Latent SpacePixel Space
+PiD
+Text𝑐Timestep𝑡
+Figure 3:Overview of PiD.PiD unifies latent decoding and upsampling as a single latent-conditioned pixel
+diffusion model that predicts the target-resolution pixel-space velocity field. Noise-corrupted latent training
+and sigma-aware gating make the decoder robust to partially denoised latents, enabling early exit from the
+base LDM while preserving high-resolution output quality.
+rotary positional encoding (RoPE) [33] with an NTK-aware RoPE variant [5] for improved spatial extrapolation.
+The resulting model serves as a high-resolution pixel diffusion prior that is later conditioned on sampled latents.
+Frompixelpriortolatentdecoder.Weconvertthishigh-resolutiontext-to-imagepriorintoalatent-conditioned
+pixel decoder by adding a lightweight ControlNet-style [63] adapter and jointly fine-tuning it with the pixel
+diffusion backbone. The adapter injects latent information into the pixel diffusion model while the text-to-image
+prior from previous stage provides a strong initialization.
+At each denoising step, the model takes a noisy target-resolution imagex𝑡, text condition𝑐, and latent
+condition z, and predicts the rectified-flow velocity in pixel space. The latent condition provides global layout
+and semantic guidance, while the pixel prior synthesizes high-resolution appearance.
+Noisy latent conditioning.Rather than conditioning only on clean latents, we expose the decoder to latents
+corrupted by varying noise levels:
+˜z𝜎 = (1−𝜎)z+𝜎𝜉,𝜉∼𝒩(0,I), 𝜎∼𝒰(0, 𝜎 max).(3)
+This serves two purposes. First, it prevents the decoder from over-trusting the latent, which can suppress
+generative detail synthesis. Second, it exposes the decoder to latents of varying quality, enabling early-exit
+inference from partially denoised latents as described in Sec. 3.4. The noise level𝜎 is also provided to the
+injection modules so that the decoder can adapt how strongly it uses the latent condition.
+Latent projection and injection.The pixel diffusion decoder operates on the noisy target-resolution imagex𝑡,
+patchified into16×16 image patches. To inject the latent condition, we align the noisy latent˜z𝜎 to this patch-
+token grid using a lightweight projection module. Concretely,˜z𝜎 is spatially upscaled with nearest-neighbor
+upsampling to match the patch-token grid, encoded by convolutional residual blocks, flattened into tokens,
+and linearly projected to the PixelDiT hidden dimension:
+ˆz𝜎 = Resize(˜z𝜎),l 𝑖 = Linear𝑖(Flatten (ResBlock(ˆz𝜎))),(4)
+where Resize(·) denotes spatial alignment to the image patch grid andResBlock(·) is the convolutional feature
+extractor. This produces latent-conditioning tokensl𝑖∈R 𝐵×𝑁×𝑑 aligned with the image tokens at transformer
+block 𝑖, where 𝑁 is the number of image patch tokens and𝑑 is the block hidden dimension. Leth𝑖 denote the
+hidden tokens at transformer block𝑖. We inject the latent condition every two backbone blocks:
+h𝑖←h 𝑖 +𝑔 𝑖(h𝑖,l 𝑖, 𝜎)⊙l𝑖,(5)
+6
+
+===== PAGE 7 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+where𝑔 𝑖(·)controls the strength of latent injection.
+Sigma-aware gating.The reliability of the latent condition depends on its noise level𝜎: clean latents provide
+strong layout and semantic cues, while noisier latents should be trusted less. We therefore modulate the
+injection in Eq. (5) with a sigma-aware gate that outputs a per-token per-channel scalar:
+𝑔𝑖(h𝑖,l 𝑖, 𝜎) = sigmoid(Linear𝑖([h𝑖,l 𝑖])−𝛼 𝜎),(6)
+where the first term predicts a content-dependent injection strength and the learned𝛼 >0 introduces a
+monotonic sigma-dependent bias that encourages weaker latent injection as the latent becomes noisier. We
+zero-initialize the latent injection heads so that training starts from the pretrained pixel prior and gradually
+learns to use the latent condition.
+3.3. Model Training
+Training the pixel diffusion prior.We first train the high-resolution pixel diffusion prior using a standard
+rectified-flow [24, 25] objective in pixel space. Given a clean imagex0 and text condition 𝑐, we sample
+𝑡∼𝒰(0,1)and construct the noisy image
+x𝑡 =𝑡x 0 + (1−𝑡)𝜖,𝜖∼𝒩(0,I).(7)
+The model predicts the rectified-flow velocity field
+v𝜃(x𝑡, 𝑡, 𝑐)≈x0−𝜖,(8)
+and is optimized with
+ℒFM =E
+[︁
+‖v𝜃(x𝑡, 𝑡, 𝑐)−(x0−𝜖)‖ 2
+2
+]︁
+.(9)
+Training the latent-conditioned decoder.Starting from the pretrained pixel prior, we jointly fine-tune the
+diffusion backbone and latent injection modules using the same rectified-flow objective, now conditioned on
+the noisy latent˜z𝜎 and its noise level𝜎defined in Eq. (3):
+ℒFM =E
+[︁
+‖v𝜃(x𝑡, 𝑡, 𝑐,˜z𝜎, 𝜎)−(x0−𝜖)‖ 2
+2
+]︁
+.(10)
+During training, the model learns to balance latent fidelity and generative synthesis across different latent
+noise levels.
+3.4. Fast Inference with Distillation and Early Termination
+Few-step distillation.We further accelerate inference by distilling our model with Distribution Matching
+Distillation (DMD2) [52]. Starting from the teacher trained in the previous stage, we train a student decoder
+that performs inference in only four sampling steps. We additionally distill classifier-free guidance into the
+student, eliminating the need for separate conditional and unconditional forward passes at inference time.
+We retain the noisy latent conditioning strategy so that the student preserves its ability to decode latents at
+varying noise levels.
+Early termination of base latent diffusionAt inference time, the base latent diffusion model can be stopped
+before completing all denoising steps, yielding a partially denoised latent with residual noise level𝜎. Note
+that this latent has the same intermediate-noise form used in noisy latent conditioning (Eq. (3)), so it can be
+passed directly to PiD for pixel-space decoding.
+4. Experiments
+In this section, we introduce implementation details of PiD. We also conduct experiments across diverse latent
+spaces and base generators to evaluate PiD’s visual quality, latency, and generalization ability.
+7
+
+===== PAGE 8 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+4.1. Data
+We train on MultiAspect-4K-1M [51], rendered PDF data, and internally procured high-resolution images. To
+improve data quality, we filter low-quality samples with Q-Align [45], resulting in2.6M high-quality images.
+We organize image data into separate buckets based on aspect ratio, specifically 16:9, 4:3, 1:1, 3:4, and
+9:16. During training, images from each bucket are center-cropped to a fixed resolution:2048×2048 for 1:1,
+2304×1728 for 4:3,1728×2304 for 3:4,2688×1536 for 16:9, and1536×2688 for 9:16. This allows our model
+to decode varying aspect-ratio images.
+We label three captions per training image: a long caption (prompt, 200–300 words), a medium caption
+(prompt_medium, 50–200 words), and a short caption (prompt_short, <50 words). During training, captions
+of different length are uniformly sampled so the model sees text ranging from detailed scene descriptions to
+concise one-liners. We use Qwen3-VL-8B-Instruct [2] via LMDeploy’s TurboMind engine for high-throughput
+batched captioning.
+4.2. Implementation Details
+Pixel-space generative prior.To have a pixel-space diffusion generator at 2K resolution, we start from the
+official pretrained PixelDiT checkpoint (1.3B parameters) and finetune it with our dataset. To adapt to higher
+resolution, we use timestep shift6, while the original checkpoint uses shift4 for 1K resolution. The PixelDiT
+backbone’s architecture uses patch size 16, hidden size 1536, 24 attention heads, 14 MM-DiT image-text
+blocks, and 2 PiT pixel blocks for pixel decoding. The PiT branch uses 16-dimensional pixel tokens, attention
+width 1152, and 16 attention heads. Text conditioning uses the frozen Gemma-2-2B-it [36] encoder with
+2304-dimensional text features and maximum sequence length 300. We use NTK-aware RoPE with a1024×1024
+reference resolution. We use batch size128 and learning rate2×10 −5 for 20,000 iterations, which takes about
+1day on128H100 GPUs.
+Latent projection and injection.For noisy latent conditioning, we set𝜎max = 0.8. The latent adapter is
+a ControlNet-style 2D convolutional path that converts the noisy low-resolution latent into per-block token
+features for injection into the PixelDiT backbone.
+After resizing latent to patch grid’s shape, the latent passes through: (i)Conv2d(16→512, 3×3, padding
+1); (ii)SiLU; (iii)Conv2d(512→512, 3×3, padding1); followed by (iv) four pre-activation residual blocks of
+the formGN 4→SiLU→Conv 3×3→GN 4→SiLU→Conv 3×3with a residual skip (all512-channel, GroupNorm
+group count4). For20482 resolution decoding target, it generates[𝐵,512,128,128] feature map, and is then
+flattened to[𝐵,16384,512]tokens.
+Per-block output heads.We inject latent-conditioning tokens into every two DiT blocks via an independent
+head per injection point, while leaving the PiT pixel blocks untouched. Each head is a singleLinear(512→1536)
+layer, weight- and bias-zero-initialized so that training starts from the pretrained text-to-image behavior. Tokens
+from each head then go through the sigma-aware gate as described in Sec. 3.2. The sigma-aware gate is
+initialized with bias2.0and𝛼≈5, formulatingsigmoid(2−5𝜎)at the beginning of training.
+We jointly fine-tune the pixel diffusion backbone and latent projection modules with batch size64 and
+learning rate 5×10 −5 for 30,000 iterations, which takes about half a day on64 H100 GPUs. We apply 10%
+caption dropout and 10% latent-condition dropout for classifier-free guidance training. For the vision encoder
+latents, our experiments show that keeping the PixelDiT backbone frozen results in less color drift than fully
+finetuning it, so we choose to freeze the backbone in these cases.
+Distillation.We distill the multi-step latent-conditioned decoder into a4-step student using the sigma schedule
+{0.999,0.866,0.634,0.342} . Following DMD2 [52], we add projected GAN regularization on intermediate
+model features. The discriminator is a DiT with26 blocks and hidden dimension1536. We set DMD loss weight
+8
+
+===== PAGE 9 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+to 1.0, and denoising score matching loss weight 1.0. The student and fake-score network is initialized from
+the same teacher architecture and checkpoint, and optimized with learning rate10−5 and weight decay10−3.
+We set the GAN loss weight to0.05 and the R1 regularization weight to200.0. The student, fake score model,
+and discriminator are trained with AdamW using a constant learning rate of1×10 −5 and batch size16 for
+3,000iterations, taking about2hours on128H100 GPUs with context parallelism 8.
+All training uses mixed precision: forward passes run in bfloat16, while gradients and optimizer states
+remain in float32. We maintain an exponential moving average (EMA) of model weights and use EMA weight
+in inference.
+4.3. Quantitative Evaluation
+Experimental setup.We conduct experiments on three types of VAE latents (FLUX.1 [19], FLUX.2 [20], Stable
+Diffusion 3 (SD3) [11]) and two types of vision-encoder latents (DINOv2 [27] and SigLIP [62]). We evaluate
+them ingenerationscenarios, where the latents are sampled from a latent diffusion model rather than encoded
+from real images.
+Specifically, we test on the FLUX.1 VAE withFLUX.1 [dev][19] andZ-Image[ 6], the SD3 VAE withStable
+Diffusion 3 Medium[11], the FLUX.2 VAE withFLUX.2 [dev][20], DINOv2-B withDiTDH [65], and SigLIP with
+Scale-RAE (DiT 2.8B)[38]. We use upsampling scale𝑠= 8for SigLIP and𝑠= 4for the rest.
+We decode partially denoised latents from the𝑀-th denoising step out of𝑁 total denoising steps with
+LDM early termination, denoted as PiD(M/N). For DINOv2, we generate latents from ImageNet-1k classes since
+DiTDH is trained for class-conditional generation; for VAE latents and SigLIP experiments, we use1,000 prompts
+from DPG-Bench [14] and run the latent diffusion model to obtain latents.
+For baseline comparison, we use the original VAE / RAE decoder and SSDD [39] for latent-to-pixel decoding,
+and then apply state-of-the-art 1-step super-resolution models [10, 41, 43, 60] to match our target output
+resolution (4× upsampling for VAE and DINOv2 latents,8× for SigLIP). We also include the latent-space
+upsampler LUA [28] in the comparison.
+Evaluation metrics.We assess decoded images with eight no-reference image-quality metrics that jointly
+capture perceptual fidelity, naturalness, and aesthetic quality without requiring ground-truth references:
+MUSIQ [17] (PaQ-2-PiQ variant), NIQE [26], DEQA [54], MANIQA [50], Q-Align [45], Unipercept [7] (IAA for
+image-aesthetic assessment and IQA for image-quality assessment), and VisualQuality-R1 [47]. We additionally
+report end-to-end decoder latency (inms) under both eager execution andtorch.compile on a single GB200
+GPU. We benchmark the latency using Dockernvcr.io/nvidian/pytorch:26.02-py3, which equips with
+NVIDIA CUDA 13.1.1, PyTorch 2.11.0. The latency of baseline methods include low-resolution decoding,
+upsampling and potential high-resolution decoding for diffusion-based super-resolution methods.
+Quantitativeresults.Table1showsthatPiDachievesthebestscoresonmostmetricsacrossallsixlatentsettings.
+On VAE latents, PiD reduces NIQE from4.04/3.76/3.50/4.05 (best baseline) to3.50/3.11/3.12/3.26 on FLUX.1,
+SD3, FLUX.2, and Z-Image, and consistently leads on Unipercept-IAA, Unipercept-IQA, and VisualQuality-R1.
+The gap is most pronounced on RAE-style semantic latents: on SigLIP, PiD raises MUSIQ from73.68 to 74.03,
+DEQA from4.00 to 4.17, and Unipercept-IAA from59.95 to 64.94, since Scale-RAE [38] struggles to generate
+well-structured latents and its decoder cannot correct these artifacts. At∼210 ms with torch.compile, PiD is
+3–6× faster than diffusion-based one-step SR baselines (SeedVR2, TSD-SR, InvSR) while delivering higher
+quality. Lighter upsamplers like Real-ESRGAN run faster because of their lightweight network architecture, but
+they produce noticeably worse visual qualities.
+9
+
+===== PAGE 10 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+Table 1:Image quality and latency across decoding pipelines.For each cascaded baseline, we apply a
+state-of-the-art upsampler to match PiD’s target output resolution. PiD attains the highest visual quality
+while running substantially faster than diffusion-based upsamplers.Red,blue, andgreendenote the best,
+second-best, and third-best per metric. “QA.” refers to Q-Align [45], “Uni.” to Unipercept [7], and “VQ-R1” to
+VisualQuality-R1 [47]. Latency is reported under both eager execution andtorch.compile on a single GB200
+GPU.
+Latency(ms)↓Latent
+(from LDM)Method MUSIQ↑
+(paq2piq)NIQE↓DEQA↑MANIQA↑QA.↑Uni.↑
+(IAA)
+Uni.↑
+(IQA)VQ-R1↑Eager Compile
+LUA [28] 67.14 7.33 4.20 0.36 4.71 59.13 70.15 4.66 730.5 369.3
+VAE Dec. + Real-ESRGAN [43]71.65 4.93 4.25 0.504.7762.95 73.77 4.65 100.5 62.2
+VAE Dec. + SeedVR2-3B [41]72.98 4.05 4.22 0.52 4.71 64.02 73.84 4.64 2084.2 1237.5
+VAE Dec. + TSD-SR [10]73.35 4.15 4.23 0.53 4.76 62.81 74.22 4.67 2113.2 724.8
+VAE Dec. + InvSR-1 [60]73.404.23 4.23 0.56 4.75 64.12 73.95 4.65 1404.1 1017.7
+SSDD + Real-ESRGAN [43]71.05 5.08 4.20 0.49 4.75 62.19 73.36 4.63 143.0 93.4
+SSDD + SeedVR2-3B [41]72.39 4.23 4.23 0.50 4.74 62.97 73.50 4.64 2126.7 1268.6
+SSDD + TSD-SR [10] 73.06 4.16 4.19 0.52 4.75 62.24 73.93 4.66 2155.7 755.9
+SSDD + InvSR-1 [60] 73.07 4.04 4.280.554.76 63.94 73.98 4.65 1445.7 1048.9
+FLUX.1 VAE
+(FLUX.1[dev])
+PiD(24/28) 73.263.50 4.310.54 4.7466.21 75.21 4.68 512.7 211.2
+VAE Dec. + Real-ESRGAN [43]72.22 4.59 3.97 0.49 4.50 55.72 70.65 4.39 100.7 62.2
+VAE Dec. + SeedVR2-3B [41]73.55 3.87 3.91 0.52 4.39 56.26 70.14 4.37 2084.4 1237.5
+VAE Dec. + TSD-SR [10]73.93 3.76 3.98 0.53 4.52 56.55 71.16 4.43 2113.4 724.8
+VAE Dec. + InvSR-1 [60]74.113.82 4.05 0.56 4.56 57.09 71.40 4.41 1404.3 1017.7
+SSDD + Real-ESRGAN [43]71.58 4.90 3.88 0.48 4.45 53.99 69.18 4.35 143.0 93.4
+SSDD + SeedVR2-3B [41]72.10 4.59 3.86 0.47 4.36 54.11 68.10 4.33 2126.7 1268.6
+SSDD + TSD-SR [10] 73.56 3.89 3.90 0.52 4.46 55.30 69.91 4.39 2155.7 755.9
+SSDD + InvSR-1 [60] 73.83 4.22 4.09 0.56 4.56 55.47 70.16 4.38 1445.7 1048.9
+SD3 VAE
+(SD3-medium)
+PiD(24/28) 74.003.11 4.26 0.56 4.66 62.57 74.22 4.59 501.4 214.0
+VAE Dec. + Real-ESRGAN [43]72.19 4.44 4.19 0.52 4.69 61.96 74.77 4.58 100.8 62.2
+VAE Dec. + SeedVR2-3B [41]73.41 3.55 4.18 0.54 4.60 62.85 74.72 4.58 2084.5 1237.4
+VAE Dec. + TSD-SR [10]74.07 3.59 4.21 0.56 4.69 61.72 75.28 4.62 2113.5 724.7
+VAE Dec. + InvSR-1 [60]74.133.65 4.250.584.72 63.52 75.47 4.60 1404.4 1017.7
+SSDD + Real-ESRGAN [43]68.95 4.48 3.14 0.48 3.46 43.94 49.30 3.47 143.0 93.4
+SSDD + SeedVR2-3B [41]64.23 3.55 3.05 0.49 3.21 42.91 45.54 3.00 2126.7 1268.6
+SSDD + TSD-SR [10] 73.76 3.50 3.72 0.55 4.07 54.21 62.25 3.98 2155.7 755.9
+SSDD + InvSR-1 [60] 73.32 3.80 3.76 0.56 4.12 50.39 60.25 3.96 1445.7 1048.9
+FLUX.2 VAE
+(FLUX.2[dev])
+PiD(45/50) 73.793.12 4.300.564.70 66.01 75.71 4.66 508.3 206.1
+LUA [28] 66.92 7.39 4.04 0.36 4.49 54.70 68.49 4.52 730.5 369.3
+VAE Dec. + Real-ESRGAN [43]71.56 4.99 4.09 0.50 4.60 56.92 71.87 4.48 100.5 62.2
+VAE Dec. + SeedVR2-3B [41]73.01 4.08 4.05 0.51 4.51 57.97 71.97 4.50 2084.2 1237.5
+VAE Dec. + TSD-SR [10]73.67 4.09 4.10 0.53 4.63 57.69 72.90 4.54 2113.2 724.8
+VAE Dec. + InvSR-1 [60]73.85 4.23 4.16 0.56 4.64 59.21 72.89 4.51 1404.1 1017.7
+SSDD + Real-ESRGAN [43]70.96 5.11 4.02 0.49 4.56 56.29 71.42 4.47 143.0 93.4
+SSDD + SeedVR2-3B [41]72.14 4.36 4.04 0.48 4.51 57.37 71.47 4.50 2126.7 1268.6
+SSDD + TSD-SR [10] 73.36 4.11 4.04 0.52 4.60 57.26 72.43 4.53 2155.7 755.9
+SSDD + InvSR-1 [60] 73.54 4.05 4.20 0.56 4.64 58.87 72.87 4.52 1445.7 1048.9
+FLUX.1 VAE
+(Z-Image)
+PiD(45/50) 74.08 3.26 4.29 0.56 4.68 63.96 75.23 4.64 498.3 211.2
+RAE Dec. + RealESRGAN68.10 4.36 3.67 0.44 3.81 50.52 60.18 4.17 94.0 67.0
+RAE Dec. + SeedVR2-3B [41]69.78 3.60 3.89 0.49 4.01 55.04 64.46 4.27 2077.7 1242.2
+RAE Dec. + TSD-SR [10]73.65 3.224.06 0.53 4.23 58.50 70.16 4.38 2106.7 729.5
+RAE Dec. + InvSR-1 [60]71.85 3.44 3.95 0.53 4.02 52.94 64.32 4.19 1396.7 1022.5
+DINOv2
+(DiTDH)
+PiD(50/50) 73.31 3.384.27 0.54 4.55 69.81 76.52 4.63 499.5 212.4
+RAE Dec. + Real-ESRGAN [43]64.07 4.58 3.57 0.43 3.79 52.05 58.54 4.14 94.8 67.4
+RAE Dec. + SeedVR2-3B [41]68.57 4.00 3.65 0.49 3.88 51.71 57.96 4.13 2078.5 1242.6
+RAE Dec. + TSD-SR [10]73.68 3.82 4.00 0.50 4.42 59.95 68.03 4.40 2107.5 730.0
+RAE Dec. + InvSR-1 [60]71.473.303.93 0.54 4.03 56.43 63.35 4.31 1397.5 1022.9
+SigLIP
+(Scale-RAE)
+PiD(50/50) 74.033.344.17 0.56 4.43 64.94 72.78 4.45 501.5 208.7
+10
+
+===== PAGE 11 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+0 20 40 60 80 100
+Win Rate (%)
+PiD
+PiD
+PiD
+PiD
+PiD
+Claude Opus 4.6
+85.4%
+98.1%
+95.4%
+87.3%
+88.8%
+20 40 60 80 100
+Win Rate (%)
+Gemini-3-Flash
+90.1%
+99.4%
+97.5%
+85.1%
+87.2%
+20 40 60 80 100
+Win Rate (%)
+InvSR-1
+LUA
+Real-ESRGAN
+SeedVR2
+TSD-SR
+GPT-5.5
+80.5%
+99.9%
+97.9%
+79.9%
+79.0%
+0 50 100
+Consistency Rate (%)
+84.3%
+98.4%
+95.3%
+83.3%
+85.6%
+0 50 100
+Consistency Rate (%)
+88.0%
+99.4%
+97.3%
+81.1%
+82.6%
+0 50 100
+Consistency Rate (%)
+79.9%
+99.9%
+98.1%
+78.2%
+80.0%
+PiD Win Rate Others Win Rate Consistency Rate in 2-round Judge
+Figure 4:Pairwise image quality preference judged by closed-source MLLMs.Three MLLMs compare
+PiD-decoded images against cascaded baselines (original VAE decoder followed by SR). All three MLLMs
+consistently prefer PiD, with high 2-round consistency under image order swap.
+Table 2: Performance of different inference steps of teacher and student model. For teacher models, more
+inference step leads to better image quality. However, few-step student model can surpass multiple-step teacher
+model in generated latent decoding cases.
+Model Num of
+Inference Step
+PiD(24/28)(FLUX.1 [dev]) Small Text Reconstruction
+MUSIQ↑NIQE↓DEQA↑MANIQA↑QA.↑Uni. (IAA)↑Uni.IQA↑VQ-R1↑PSNR↑SSIM↑LPIPS↓
+Teacher 50 71.79 4.92 4.28 0.49 4.74 63.82 73.35 4.64 24.960.9660.16
+Teacher 25 71.63 5.43 4.29 0.49 4.75 63.36 73.26 4.65 25.00 0.965 0.18
+Teacher 12 70.95 6.02 4.29 0.484.7662.68 72.90 4.64 25.120.9660.18
+Teacher 8 70.32 6.31 4.29 0.47 4.75 62.15 72.51 4.64 25.24 0.964 0.19
+Teacher 4 68.32 7.00 4.24 0.45 4.72 60.50 71.13 4.63 25.700.960 0.21
+Student 4 73.26 3.50 4.31 0.544.7466.21 75.21 4.68 24.19 0.9640.09
+Closed-source multimodal LLM judgment.We adopt three of the most powerful closed-source multimodal
+LLMs (MLLMs) for pairwise comparison: Gemini 3 Flash, GPT 5.5, and Claude Opus 4.6. Given image A and
+image B, the MLLM is asked to judge which one is better in quality and detail. To avoid order bias, we use a
+two-round evaluation by switching the input order of A and B, and report agreement across the two rounds to
+measure the model’s confidence. We call it consistency rate. A higher consistency rate indicates that the model
+is more confident in its assessment and suggests a greater difference in image quality.
+As shown in Figure 4, all three MLLMs consistently judge PiD to outperform the baseline methods, with
+high PiD win rate and high 2-round consistency.
+Decoding Step AnalysisWe evaluate the teacher model with {50, 25, 12, 8, 4} inference steps, and compare it
+with our distilled 4-step student using the latent generated by FLUX.1 [dev]. As expected, the teacher exhibits
+a quality–cost trade-off: reducing steps gradually degrades perceptual metrics (e.g., MUSIQ decreases and
+NIQE increases), with the 4-step teacher being the weakest. But the 4-step student not only closes the gap but
+surpasses all multi-step teacher variants on IQA metrics (best MUSIQ/NIQE/DEQA/MANIQA and the highest
+uniformity/IQA scores in Table 2), indicating that distillation successfully transfers multi-step behavior into a
+few-step decoder.
+For small-text reconstruction, the picture is more nuanced: while the multi-step teacher variants achieve
+higher PSNR/SSIM, the student substantially improves perceptual similarity (lowest LPIPS). This suggests that
+the student prioritizes visually plausible character strokes and local textures, but the pixel-wise alignment is
+not maximized.
+11
+
+===== PAGE 12 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+Input(512 2)FLUX.1 VAE(512 2)PiD(2048 2)Input(512 2)Scale-RAE(512 2)PiD(2048 2)
+Figure 5:Image reconstruction comparison.Given a latent encoded from a clean image, PiD reconstructs the
+image at higher resolution with sharper details than the original VAE / RAE decoder.
+VAE decoding
+PiD decoding
+16/28 step 20/28 step 24/28 step 26/28 step full (28) step
+Figure 6:VAE decoding and PiD decoding at different LDM termination steps. Top: VAE decoding.Bottom:
+PiD decoding. With the full LDM denoising steps, PiD is faithful to the latent’s VAE decoding results; at
+intermediate steps, because the base latent diffusion model has not denoised all the subtle details, it allows PiD
+to imagine additional details.
+4.4. Qualitative Evaluation
+Reconstruction on real-world image’s latent.We visualize reconstruction quality in Figure 5 by decoding
+latents encoded from clean images and comparing vanilla reconstructions (FLUX.1 VAE / Scale-RAE decoder)
+against our PiD reconstruction. Results show that PiD preserves finer and sharper details at higher resolution.
+The small text is corrupted by VAE encoding and VAE decoding, however, with PiD’s generative ability, it can
+reconstruct the correct text with high sharpness.
+Decoding at different LDM termination step.We show the VAE decoding and PiD decoding results at different
+LDM termination steps in Figure 6. With the full 28 denoising steps, PiD remains closer to the original latent
+representation, while at intermediate step counts, PiD tends to generate additional content and can produce
+sharper details.
+Compare with super-resolution baselines.We further compare image-generation decoding in Figure 7.
+Starting from FLUX.1 [dev] latents of5122 images, we compare PiD with cascaded super-resolution baselines,
+showing that PiD yields richer details with lower inference latency than diffusion-based SR methods. Here we
+use PiD(24/28)in the figure.
+12
+
+===== PAGE 13 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+VAE Decode(5122)+SeedVR2-3B(2048 2)+InvSR(2048 2)+TSD-SR(2048 2)Ours(2048 2)
+18.25 ms
+ 1237.4 ms
+ 1017.7 ms
+ 724.7 ms
+ 211.2 ms
+18.25 ms
+ 1237.4 ms
+ 1017.7 ms
+ 724.7 ms
+ 211.2 ms
+18.25 ms
+ 1237.4 ms
+ 1017.7 ms
+ 724.7 ms
+ 211.2 ms
+18.25 ms
+ 1237.4 ms
+ 1017.7 ms
+ 724.7 ms
+ 211.2 ms
+VAE Decode(5122)+SeedVR2-3B(2048 2)+InvSR(2048 2)+TSD-SR(2048 2)Ours(2048 2)
+Figure 7:PiD vs. cascaded super-resolution.From a FLUX.1 [dev] latent of a5122 image, baselines apply a
+super-resolution model on VAE decoding output, while PiD decodes directly to20482. PiD produces sharper
+detail at lower latency. Latency is measured on a single GB200 GPU withtorch.compile.
+13
+
+===== PAGE 14 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+Table 3:PiD latency and decoder memory usageacross
+output resolutions, compared with the original VAE decoder.
+PiD Latency (ms)
+GPU Type Compile 256px 512px 1024px 2048px 4096px
+RTX 5090✗79.1 114.1 273.1 1388.8 OOM
+RTX 5090✓52.5 78.4 188.2 979.3 9238.0
+H100✗272.2 279.3 211.6 797.0 4763.4
+H100✓36.5 45.3 88.4 446.0 3754.6
+GB200✗265.1 260.8 251.2 505.1 2944.1
+GB200✓32.2 33.0 57.0 208.8 1927.3
+Decoder Memory Usage (GB)
+Decoder Compile 256px 512px 1024px 2048px 4096px
+FLUX.1 VAE✗0.3 0.7 2.6 37.0 OOM
+FLUX.1 VAE✓0.4 0.8 2.4 16.7 OOM
+PiD✗12.6 12.8 13.6 16.5 28.6
+PiD✓10.3 10.3 10.9 13.0 22.5
+4.62
+4.64
+4.66
+4.68
+VisualQuality-R1
+8 10 12 14 16 18 20 22 24 26 28
+LDM Termination Step
+4.68
+4.70
+4.72
+4.74QAlign
+QAlign
+VisualQuality-R1
+Figure 8:Image quality of PiD at different
+LDM termination stepfor FLUX.1 [dev] (28
+denoising steps in total).
+Table 4:Ablation studyon FLUX.1 [dev] decoding (left) and small-text reconstruction (right).
+Tasks PiD(24/28)(FLUX.1 [dev]) Small Text Reconstruction
+Method MUSIQ↑
+(paq2piq)NIQE↓DEQA↑MANIQA↑QA.↑ Uni.↑
+(IAA)
+Uni.↑
+(IQA) VQ-R1↑ PSNR↑SSIM↑LPIPS↓
+w/o T2I prior 59.52 7.79 2.649 0.282 2.58 52.25 46.93 2.587 17.21 0.292 0.584
+w/o sigma-aware gate70.84 5.844.2920.472 4.7563.4973.21 4.647 24.28 0.956 0.202
+Ours 71.63 5.434.2890.487 4.7563.3673.26 4.649 25.00 0.965 0.179
+4.5. Inference Cost
+PiD is efficient with respect to both latency and memory consumption. Table 3 reports the runtime and peak
+memory usage when decoding to different output resolutions. Compared with standard VAE decoding, PiD
+scales more favorably with resolution and consistently remains within a practical memory budget, requiring
+less than 30GB even at 4K decoding. In contrast, the VAE decoder runs out of memory at resolutions of
+approximately2500 2 pixels on an80GB GPU without tiling.
+4.6. Ablation and Discussion
+Ablation study.Table 4 studies two key design choices: (i) the text-to-image pixel prior and (ii) the sigma-
+aware gating module. Removing the T2I prior severely degrades latent decoding (e.g., NIQE rises from5.43 to
+7.79, VisualQuality-R1 [47] drops from4.649 to 2.587), showing that the high-resolution pretraining prior is
+crucial for generative SR. Removing the sigma-aware gate consistently worsens perceptual quality and fidelity,
+confirming that explicitly controlling the decoder’s reliance on the latent is beneficial. The gap is even larger in
+small-text reconstruction, where local fidelity is critical. Metrics are computed with the pre-distillation model
+over 25 denoising steps.
+Optimal LDM termination step.We study the optimal number of LDM denoising steps for decoding partially
+denoised latents. Terminating too early leaves the latent semantically under-formed and harms output quality,
+while running full denoising leaves little room for the decoder to synthesize fine detail and increases overall
+latency. Figure 8 shows the image quality of PiD at different LDM termination step for FLUX.1 [dev], which has
+28 denoising steps in total. It shows that the last 3 to 5 steps provide better visual quality than other steps.
+Other VAE latents show similar behaviors.
+LDM + PiD vs. native 2K generation.For high-resolution generation, running an LDM with PiD provides
+a practical alternative that achieves competitive visual quality with substantially lower sampling cost. We
+14
+
+===== PAGE 15 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+13.3s
+ 102.2s
+ 6.6s
+ 7.1s
+13.3s
+ 102.2s
+ 6.6s
+ 7.1s
+PixelDiT (native2048 2) FLUX.2 (native2048 2) FLUX.2(512 2)+ VAE Dec. FLUX.2(512 2)+ PiD
+Figure 9:Comparison with native 2048×2048 px generation.Coupling a low-resolution LDM with PiD
+substantially reduces inference time while maintaining image quality competitive to native high-resolution
+generation, and in some cases surpassing it in fine-grained details. Latency (in lower left corner) is measured
+on a single GB200 GPU withouttorch.compile.
+compare native 2K generation of FLUX.2, PixelDiT, and FLUX.2(5122) + PiD. FLUX.2 and PixelDiT use 50
+sampling steps at 2K or 512 resolution, while PiD runs 4 steps on a FLUX.2 generated latent of5122 pixels. As
+a result (see Figure 9), FLUX.2(5122) + PiD only needs7.1s per sample, making it1.87× faster than PixelDiT
+and 14.3× faster than FLUX.2. Qualitatively, it shows better prompt following and visual quality than PixelDiT,
+and produces sharper details than native FLUX.2 in some cases. Given the substantial difference in model size
+(FLUX.2: 32B vs. PiD: 1.3B parameters) and inference cost (FLUX.2: 102.2s vs. w/ PiD 7.1s), we interpret
+these results as evidence that latent diffusion model equipped with PiD decoding strategy achieves favorable
+performance.
+4.7. Extend to 4K Decoding
+PiD can easily extend to 4K decoding. We follow the same training recipe: first train a 4K resolution text-to-
+image pixel diffusion prior, then add latent projection adapter on the top of the backbone, and finally distill
+it into a 4-step student model. The experimental configuration and hyper-parameters stay the same as the
+2K-resolution model mentioned in 4.2. We use 96 GB200 GPUs with context parallel 2 for text-to-image model
+and teacher model training, and 96 GB200 GPUs with context parallel 4 for distillation. We show qualitative
+results of 4K decoding in Figure 2.
+5. Conclusion
+We introduced PiD, a pixel diffusion decoder that replaces reconstruction-oriented latent decoding with
+conditional pixel diffusion. This formulation unifies decoding and super-resolution in a single generative
+module, improving both speed and quality of high-resolution image synthesis from VAE and RAE-style latent
+spaces. PiD can also decode partially denoised latents, which allows early termination of base latent diffusion
+while preserving high-fidelity outputs.
+15
+
+===== PAGE 16 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+A. MLLM Judgment Details
+For each paired sample(𝑥𝑖, 𝑦𝑖), where 𝑥𝑖 denotes the image from our method and𝑦𝑖 denotes the baseline
+image, we ask a closed-source MLLM to select the image with better perceptual quality and details. The exact
+prompt used for pairwise judgment is:
+You are a strict image-quality judge. Two images follow, labeled Image A and Image B.
+Compare them on perceptual quality and detail: sharpness, fine texture, noise, compression
+artifacts, ringing, blocking, over-smoothing, over-sharpening, edge halos.
+Where to look (anchor your judgement on these regions):
+•Fine textures: hair, foliage, fabric weave, skin pores, small printed text.
+•Edges: clean transitions with no ringing, halos, or stair-stepping.
+•Flat / smooth regions: free of blocking, banding, color noise, or chroma smear.
+•Repetitive patterns (grilles, bricks, screens): no moire / aliasing.
+Position-bias rule: do NOT favor A or B because of their order. Mentally swap A and B and
+re-check; only commit to a side if the same side still looks better.
+You MUST pick a side – no ties, no hedging. If you’re genuinely unsure, pick the side that
+wins on the largest number of the anchor regions above.
+Output format (strict – the FIRST line MUST be the verdict):
+Line 1 must be exactly one of:
+VERDICT: A – A is better in quality / detail
+VERDICT: B – B is better in quality / detail
+From line 2 onward: 1–3 sentences of justification in English.
+The MLLM output is parsed by extracting the first valid verdict from the response, where onlyVERDICT:
+A and VERDICT: B are accepted. Ties are not allowed. Invalid or unparseable responses are treated as failed
+judgments and are excluded from the final win-rate calculation.
+To reduce position bias, each image pair is evaluated twice with swapped input order. In the first round,
+our result is shown as Image A and the baseline result is shown as Image B. In the second round, the order is
+reversed: the baseline result is shown as Image A and our result is shown as Image B. The raw A/B verdicts are
+then converted into method-level preferences, i.e., whether the MLLM prefersOursorBasein each round.
+For each baseline and each judge model, the win rate of our method is computed over all valid judgments
+from the two rounds. Specifically, we count how many times the MLLM selects our result and divide it by the
+total number of valid non-failed judgments. Thus, each image pair can contribute up to two valid votes, one
+from the original order and one from the swapped order.
+We also report the consistency rate to measure whether the MLLM gives a stable preference under order
+swapping. For each image pair, we compare the method-level preference from the two rounds. If both rounds
+are valid and they select the same method, the pair is counted as consistent. A higher consistency rate indicates
+that the judge’s preference is less sensitive to the input order. Samples of evaluation can be found in Figures 10
+and 11.
+16
+
+===== PAGE 17 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+Figure 10: MLLM evaluation sample 1.
+17
+
+===== PAGE 18 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+Figure 11: MLLM evaluation sample 2.
+18
+
+===== PAGE 19 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+References
+[1] A. Arora, Z. Tu, Y. Wang, R. Bai, J. Wang, and S. Ma. Guidesr: Rethinking guidance for one-step high-fidelity
+diffusion-based super-resolution. InProceedings of the IEEE/CVF International Conference on Computer Vision, pages
+3914–3922, 2025. 5
+[2] S. Bai, Y. Cai, R. Chen, K. Chen, X. Chen, Z. Cheng, L. Deng, W. Ding, C. Gao, C. Ge, W. Ge, Z. Guo, Q. Huang,
+J. Huang, F. Huang, B. Hui, S. Jiang, Z. Li, M. Li, M. Li, K. Li, Z. Lin, J. Lin, X. Liu, J. Liu, C. Liu, Y. Liu, D. Liu, S. Liu,
+D. Lu, R. Luo, C. Lv, R. Men, L. Meng, X. Ren, X. Ren, S. Song, Y. Sun, J. Tang, J. Tu, J. Wan, P. Wang, P. Wang, Q. Wang,
+Y. Wang, T. Xie, Y. Xu, H. Xu, J. Xu, Z. Yang, M. Yang, J. Yang, A. Yang, B. Yu, F. Zhang, H. Zhang, X. Zhang, B. Zheng,
+H. Zhong, J. Zhou, F. Zhou, J. Zhou, Y. Zhu, and K. Zhu. Qwen3-vl technical report.arXiv preprint arXiv:2511.21631,
+2025. 8
+[3] J. Betker, G. Goh, L. Jing, T. Brooks, J. Wang, L. Li, L. Ouyang, J. Zhuang, J. Lee, Y. Guo, et al. Improving image
+generation with better captions.Computer Science, 2(3):8, 2023. 4
+[4] T. Bi, X. Zhang, Y. Lu, and N. Zheng. Vision foundation models can be good tokenizers for latent diffusion models.
+arXiv preprint arXiv:2510.18457, 2025. 4
+[5] bloc97. Ntk-aware scaled rope.https://www.reddit.com/r/LocalLLaMA/comments/14lz7j5/ntkaware_scaled_
+rope_allows_llama_models_to_have/. 6
+[6] H. Cai, S. Cao, R. Du, P. Gao, S. Hoi, Z. Hou, S. Huang, D. Jiang, X. Jin, L. Li, et al. Z-image: An efficient image
+generation foundation model with single-stream diffusion transformer.arXiv preprint arXiv:2511.22699, 2025. 9
+[7] S. Cao, J. Li, X. Li, Y. Pu, K. Zhu, Y. Gao, S. Luo, Y. Xin, Q. Qin, Y. Zhou, et al. Unipercept: Towards unified perceptual-
+level image understanding across aesthetics, quality, structure, and texture.arXiv preprint arXiv:2512.21675, 2025.
+9, 10
+[8] J. Chen, H. Cai, J. Chen, E. Xie, S. Yang, H. Tang, M. Li, Y. Lu, and S. Han. Deep compression autoencoder for efficient
+high-resolution diffusion models.arXiv preprint arXiv:2410.10733, 2024. 4
+[9] J. Chen, C. Ge, E. Xie, Y. Wu, L. Yao, X. Ren, Z. Wang, P. Luo, H. Lu, and Z. Li. PixArt-Σ: Weak-to-strong training of
+diffusion transformer for 4k text-to-image generation. InEuropean Conference on Computer Vision (ECCV), 2024. 5
+[10] L. Dong, Q. Fan, Y. Guo, Z. Wang, Q. Zhang, J. Chen, Y. Luo, and C. Zou. Tsd-sr: One-step diffusion with target
+score distillation for real-world image super-resolution. InProceedings of the Computer Vision and Pattern Recognition
+Conference, pages 23174–23184, 2025. 5, 9, 10
+[11] P. Esser, S. Kulal, A. Blattmann, R. Entezari, J. Müller, H. Saini, Y. Levi, D. Lorenz, A. Sauer, F. Boesel, et al. Scaling
+rectified flow transformers for high-resolution image synthesis. InForty-first international conference on machine
+learning, 2024. 5, 9
+[12] J. Heek, E. Hoogeboom, T. Mensink, and T. Salimans. Unified latents (ul): How to train your latents.arXiv preprint
+arXiv:2602.17270, 2026. 4
+[13] J. Ho, C. Saharia, W. Chan, D. J. Fleet, M. Norouzi, and T. Salimans. Cascaded diffusion models for high fidelity
+image generation.Journal of Machine Learning Research, 23(47):1–33, 2022. 5
+[14] X. Hu, R. Wang, Y. Fang, B. Fu, P. Cheng, and G. Yu. Ella: Equip diffusion models with llm for enhanced semantic
+alignment.arXiv preprint arXiv:2403.05135, 2024. 9
+[15] J. Jeong, S. Han, J. Kim, and S. J. Kim. Latent space super-resolution for higher-resolution image generation with
+diffusion models. InProceedings of the Computer Vision and Pattern Recognition Conference, pages 2355–2365, 2025. 5
+[16] K. Kawai, T. Oba, K. Tokoro, K. Akita, and N. Ukita. Efficient burst super-resolution with one-step diffusion. In
+Proceedings of the Computer Vision and Pattern Recognition Conference, pages 864–873, 2025. 5
+[17] J. Ke, Q. Wang, Y. Wang, P. Milanfar, and F. Yang. Musiq: Multi-scale image quality transformer. InProceedings of the
+IEEE/CVF international conference on computer vision, pages 5148–5157, 2021. 9
+19
+
+===== PAGE 20 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+[18] D. P. Kingma and M. Welling. Auto-encoding variational Bayes. InInternational Conference on Learning Representations
+(ICLR), 2014. 3, 4
+[19] B. F. Labs. Flux.https://github.com/black-forest-labs/flux, 2024. 9
+[20] B. F. Labs. FLUX.2: Frontier Visual Intelligence.https://bfl.ai/blog/flux-2, 2025. 9
+[21] T. Li and K. He. Back to basics: Let denoising generative models denoise.arXiv preprint arXiv:2511.13720, 2025. 3, 5
+[22] T. Li, Y. Tian, H. Li, M. Deng, and K. He. Autoregressive image generation without vector quantization. InAdvances in
+Neural Information Processing Systems (NeurIPS), 2024. 3, 4
+[23] X. Lin, J. He, Z. Chen, Z. Lyu, B. Dai, F. Yu, Y. Qiao, W. Ouyang, and C. Dong. DiffBIR: Toward blind image restoration
+with generative diffusion prior. InEuropean Conference on Computer Vision, pages 430–448. Springer, 2024. 5
+[24] Y. Lipman, R. T. Chen, H. Ben-Hamu, M. Nickel, and M. Le. Flow matching for generative modeling.arXiv preprint
+arXiv:2210.02747, 2022. 7
+[25] X. Liu, C. Gong, and Q. Liu. Flow straight and fast: Learning to generate and transfer data with rectified flow.arXiv
+preprint arXiv:2209.03003, 2022. 7
+[26] A. Mittal, R. Soundararajan, and A. C. Bovik. Making a “completely blind” image quality analyzer.IEEE Signal
+processing letters, 20(3):209–212, 2012. 9
+[27] M. Oquab, T. Darcet, T. Moutakanni, H. V. Vo, M. Szafraniec, V. Khalidov, P. Fernandez, D. Haziza, F. Massa, A. El-
+Nouby, M. Assran, N. Ballas, W. Galuba, R. Howes, P.-Y. Huang, S.-W. Li, I. Misra, M. Rabbat, V. Sharma, G. Synnaeve,
+H. Xu, H. Jégou, J. Mairal, P. Labatut, A. Joulin, and P. Bojanowski. DINOv2: Learning robust visual features without
+supervision.Transactions on Machine Learning Research, 2024. 4, 9
+[28] A. Razin, D. Kazantsev, and I. Makarov. One small step in latent, one giant leap for pixels: Fast latent upscale adapter
+for your diffusion models.arXiv preprint arXiv:2511.10629, 2025. 5, 9, 10
+[29] D.J.Rezende, S.Mohamed, andD.Wierstra. Stochasticbackpropagationandapproximateinferenceindeepgenerative
+models. InInternational Conference on Machine Learning (ICML), 2014. 3, 4
+[30] R. Rombach, A. Blattmann, D. Lorenz, P. Esser, and B. Ommer. High-resolution image synthesis with latent diffusion
+models. InProceedings of the IEEE/CVF conference on computer vision and pattern recognition, pages 10684–10695,
+2022. 3, 4
+[31] C. Saharia, J. Ho, W. Chan, T. Salimans, D. J. Fleet, and M. Norouzi. Image super-resolution via iterative refinement.
+arXiv preprint arXiv:2104.07636, 2021. 5
+[32] J. Shi, C. Wu, J. Liang, X. Liu, and N. Duan. DiVAE: Photorealistic images synthesis with denoising diffusion decoder,
+2022. 4
+[33] J. Su, M. Ahmed, Y. Lu, S. Pan, W. Bo, and Y. Liu. Roformer: Enhanced transformer with rotary position embedding.
+Neurocomputing, 568:127063, 2024. 6
+[34] P. Sun, Y. Jiang, S. Chen, S. Zhang, B. Peng, P. Luo, and Z. Yuan. Autoregressive model beats diffusion: Llama for
+scalable image generation.arXiv preprint arXiv:2406.06525, 2024. 3, 4
+[35] Y. Sun, L. Sun, S. Liu, R. Wu, Z. Zhang, and L. Zhang. One-step diffusion for detail-rich and temporally consistent
+video super-resolution. InThe Thirty-ninth Annual Conference on Neural Information Processing Systems, 2025. 5
+[36] G. Team, M. Riviere, S. Pathak, P. G. Sessa, C. Hardin, S. Bhupatiraju, L. Hussenot, T. Mesnard, B. Shahriari, A. Ramé,
+et al. Gemma 2: Improving open language models at a practical size.arXiv preprint arXiv:2408.00118, 2024. 8
+[37] K. Tian, Y. Jiang, Z. Yuan, B. Peng, and L. Wang. Visual autoregressive modeling: Scalable image generation via
+next-scale prediction. InAdvances in Neural Information Processing Systems (NeurIPS), 2024. 3, 4
+20
+
+===== PAGE 21 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+[38] S. Tong, B. Zheng, Z. Wang, B. Tang, N. Ma, E. Brown, J. Yang, R. Fergus, Y. LeCun, and S. Xie. Scaling text-to-image
+diffusion transformers with representation autoencoders, 2026. 4, 9
+[39] T. Vallaeys, J. Verbeek, and M. Cord. SSDD: Single-step diffusion decoder for efficient image tokenization.arXiv
+preprint arXiv:2510.04961, 2025. 3, 4, 9
+[40] A. Van Den Oord, O. Vinyals, et al. Neural discrete representation learning.Advances in neural information processing
+systems, 30, 2017. 4
+[41] J. Wang, S. Lin, Z. Lin, Y. Ren, M. Wei, Z. Yue, S. Zhou, H. Chen, Y. Zhao, C. Yang, et al. Seedvr2: One-step video
+restoration via diffusion adversarial post-training.arXiv preprint arXiv:2506.05301, 2025. 9, 10
+[42] J. Wang, Z. Yue, S. Zhou, K. C. K. Chan, and C. C. Loy. Exploiting diffusion prior for real-world image super-resolution,
+2023. 5
+[43] X. Wang, L. Xie, C. Dong, and Y. Shan. Real-ESRGAN: Training real-world blind super-resolution with pure synthetic
+data. InIEEE/CVF International Conference on Computer Vision Workshops (ICCVW), 2021. 5, 9, 10
+[44] X. Wang, K. Yu, S. Wu, J. Gu, Y. Liu, C. Dong, C. C. Loy, X. Tang, and Y. Qiao. ESRGAN: Enhanced super-resolution
+generative adversarial networks. InEuropean Conference on Computer Vision Workshops (ECCVW), 2018. 5
+[45] H. Wu, Z. Zhang, W. Zhang, C. Chen, C. Li, L. Liao, A. Wang, E. Zhang, W. Sun, Q. Yan, X. Min, G. Zhai, and W. Lin.
+Q-align: Teaching lmms for visual scoring via discrete text-defined levels.arXiv preprint arXiv:2312.17090, 2023.
+Equal Contribution by Wu, Haoning and Zhang, Zicheng. Project Lead by Wu, Haoning. Corresponding Authors: Zhai,
+Guangtai and Lin, Weisi. 8, 9, 10
+[46] R. Wu, T. Yang, L. Sun, Z. Zhang, S. Li, and L. Zhang. SeeSR: Towards semantics-aware real-world image super-
+resolution. InProceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), pages
+25456–25467, 2024. 5
+[47] T. Wu, J. Zou, J. Liang, L. Zhang, and K. Ma. Visualquality-r1: Reasoning-induced image quality assessment via
+reinforcement learning to rank.arXiv preprint arXiv:2505.14460, 2025. 9, 10, 14
+[48] X. Wu, J. Xin, J. Hao, H. Gao, J. Li, N. Wang, and X. Gao. One-step diffusion-based real-world image super-resolution
+with visual perception distillation.Neurocomputing, page 133066, 2026. 5
+[49] E. Xie, J. Chen, J. Chen, H. Cai, H. Tang, Y. Lin, Z. Zhang, M. Li, L. Zhu, Y. Lu, and S. Han. SANA: Efficient
+high-resolution image synthesis with linear diffusion transformer, 2024. 5
+[50] S. Yang, T. Wu, S. Shi, S. Lao, Y. Gong, M. Cao, J. Wang, and Y. Yang. Maniqa: Multi-dimension attention network
+for no-reference image quality assessment. InProceedings of the IEEE/CVF conference on computer vision and pattern
+recognition, pages 1191–1200, 2022. 9
+[51] T. Ye, S. Fei, and L. Zhu. UltraFlux: Data-model co-design for high-quality native 4k text-to-image generation across
+diverse aspect ratios.arXiv preprint arXiv:2511.18050, 2025. 5, 8
+[52] T. Yin, M. Gharbi, T. Park, R. Zhang, E. Shechtman, F. Durand, and W. T. Freeman. Improved distribution matching
+distillation for fast image synthesis.Advances in neural information processing systems, 37:47455–47487, 2024. 4, 7, 8
+[53] W. You, M. Zhang, L. Zhang, X. Zhou, K. Shi, and S. Gu. Consistency trajectory matching for one-step generative
+super-resolution. InProceedings of the IEEE/CVF International Conference on Computer Vision, pages 12747–12756,
+2025. 5
+[54] Z. You, X. Cai, J. Gu, T. Xue, and C. Dong. Teaching large language models to regress accurate image quality scores
+using score distribution. InProceedings of the Computer Vision and Pattern Recognition Conference, pages 14483–14494,
+2025. 9
+[55] F. Yu, J. Gu, Z. Li, J. Hu, X. Kong, X. Wang, J. He, Y. Qiao, and C. Dong. Scaling up to excellence: Practicing model
+scaling for photo-realistic image restoration in the wild. InProceedings of the IEEE/CVF Conference on Computer Vision
+and Pattern Recognition (CVPR), pages 25669–25680, 2024. 5
+21
+
+===== PAGE 22 =====
+
+PiD : Fast and High-Resolution Latent Decoding with Pixel Diffusion
+[56] J. Yu, Y. Xu, J. Y. Koh, T. Luong, G. Baid, Z. Wang, V. Vasudevan, A. Ku, Y. Yang, B. K. Ayan, B. Hutchinson, W. Han,
+Z. Parekh, X. Li, H. Zhang, J. Baldridge, and Y. Wu. Scaling autoregressive models for content-rich text-to-image
+generation.Transactions on Machine Learning Research, 2022. 3, 4
+[57] L. Yu, J. Lezama, N. B. Gundavarapu, L. Versari, K. Sohn, D. Minnen, Y. Cheng, V. Birodkar, A. Gupta, X. Gu, et al.
+Language model beats diffusion–tokenizer is key to visual generation.arXiv preprint arXiv:2310.05737, 2023. 4
+[58] Q. Yu, M. Weber, X. Deng, X. Shen, D. Cremers, and L.-C. Chen. An image is worth 32 tokens for reconstruction and
+generation.Advances in Neural Information Processing Systems, 37:128940–128966, 2024. 4
+[59] Y. Yu, W. Xiong, W. Nie, Y. Sheng, S. Liu, and J. Luo. Pixeldit: Pixel diffusion transformers for image generation.arXiv
+preprint arXiv:2511.20645, 2025. 3, 5
+[60] Z. Yue, K. Liao, and C. C. Loy. Arbitrary-steps image super-resolution via diffusion inversion. InProceedings of the
+Computer Vision and Pattern Recognition Conference, pages 23153–23163, 2025. 5, 9, 10
+[61] Z. Yue, J. Wang, and C. C. Loy. ResShift: Efficient diffusion model for image super-resolution by residual shifting.
+arXiv preprint arXiv:2307.12348, 2023. 5
+[62] X. Zhai, B. Mustafa, A. Kolesnikov, and L. Beyer. Sigmoid loss for language image pre-training. InProceedings of the
+IEEE/CVF International Conference on Computer Vision (ICCV), pages 11975–11986, 2023. 4, 9
+[63] L. Zhang, A. Rao, and M. Agrawala. Adding conditional control to text-to-image diffusion models. InProceedings of
+the IEEE/CVF International Conference on Computer Vision (ICCV), pages 3836–3847, 2023. 6
+[64] L. Zhao, S. Woo, Z. Wan, Y. Li, H. Zhang, B. Gong, H. Adam, X. Jia, and T. Liu. Epsilon-VAE: Denoising as visual
+decoding. InProceedings of the 42nd International Conference on Machine Learning (ICML), 2025. 3, 4
+[65] B. Zheng, N. Ma, S. Tong, and S. Xie. Diffusion transformers with representation autoencoders.arXiv preprint
+arXiv:2510.11690, 2025. 3, 4, 9
+22
