@@ -19,8 +19,8 @@ The port = inflate Conv2d→Conv3d in the LQ projection (9 layers), generalize R
 - **T5:** umT5-XXL bf16 = 9.4GB. **Must stay on CPU** at inference on 3090 (`wan/modules/t5.py:472`).
 - **Default inference:** UniPC 50 steps, CFG 5-6, shift 8-12 for 1.3B@480P, 81 frames @ 16 fps
 - **VRAM:** ~6.7GB peak on 3090 with `--t5_cpu --offload_model True`. **17GB headroom for video-PiD.**
-- **Latent shape for 16f@480×832:** `(16, 5, 60, 104)` — 16 ch × 5 temporal × 60 × 104 spatial = 49,920 latent values
-- **DiT seq_len for 16f@480×832:** `math.ceil((60*104)/(2*2) * 5)` = 19,500 tokens (patch 1,2,2)
+- **Latent shape for 16f@480×832:** `(16, 4, 60, 104)` — 16 ch × 4 temporal × 60 × 104 spatial = 39,936 latent values
+- **DiT seq_len for 16f@480×832:** `math.ceil((60*104)/(2*2) * 4)` = 15,600 tokens (Wan patch 1,2,2)
 
 ## Spec (video-PiD)
 
@@ -29,7 +29,7 @@ The port = inflate Conv2d→Conv3d in the LQ projection (9 layers), generalize R
 | Backbone | PixelDiT-SR v1.5 (1B params, ~120M trainable in LQ-proj-only mode) | NVIDIA PiD v1.5 qwenimage checkpoint |
 | Input projection | LQ projection: Conv3d (inflated from Conv2d, 9 layers) | NVIDIA `pid/_src/networks/lq_projection_2d.py` |
 | Patch embed | `Conv3d(3, dim, kernel=(2,8,8), stride=(2,8,8))` | Architecture spec |
-| Pixel tokens (16f×480×832) | 5 × 60 × 60 = **18,000 tokens** | 16f / 2 stride = 8 temp, 480/8=60, 832/8=104. With conv3d kernel=2,8,8 stride=2,8,8 → 8×60×104 → 49,920 input. After kernel 2x8x8: 4×60×104. Adjust as kernel shrinks. |
+| Pixel tokens (16f×480×832) | `8 × 60 × 104 = 49,920 tokens` | kernel (2,8,8) stride (2,8,8) on (T=16, H=480, W=832) → (8, 60, 104) |
 | Attention | Sliding Tile Attention (tile ~ T=4, H=8, W=8), fallback factorised T-then-S | arXiv 2502.04507 |
 | Conditioning | Sigma-aware adapter (LQ + noise-corrupted latent + σ → AdaLN) | NVIDIA PiD paper |
 | Output | Residual: `final = Wan_decode + Δ` | ResShift, SinSR, ImpRes |

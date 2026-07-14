@@ -12,11 +12,15 @@ Two-phase training, designed for 1× RTX 3090 (24GB).
 | Loss | Weight | Source |
 |---|---|---|
 | Flow-matching velocity MSE | 1.0 | Standard PiD |
-| RGB-align (v1.5) | 0.8 | PiD v1.5 — kills color drift |
-| LPIPS / DISTS / SSIM | 0 | Implicit, no need |
-| Flow-warp aux (optional, video) | 0.1-0.3 | Upscale-A-Video, Go-with-the-Flow |
+| LPIPS perceptual | 0.25 | SeedVR recipe, subagent 3 |
+| 3D-feat-disc (GAN) | 0.1 | NVIDIA `Discriminator_VideoDiT` (already in PiD repo) |
+| RAFT flow consistency | 0.05 | Upscale-A-Video, Go-with-the-Flow |
+| TV_t (temporal) | 0.01 | Anti-flicker |
+| RGB-align (v1.5) | (NOT USED, dropped from v1.5 final recipe) | superseded by LPIPS+disc |
 
-**Total: ~1.0 + 0.8 = 1.8 effective loss terms.** No need for LPIPS, the PiD v1.5 paper showed it's implicit.
+**Two-stage schedule:**
+- **Stage 1 (no GAN):** `L = 1.0·flow + 0.25·LPIPS + 0.05·RAFT + 0.01·TV_t` for first 10k iters (GAN warmup, ~12h on 3090)
+- **Stage 2 (with GAN):** add 0.1·3D-feat-disc for next 20k iters (~3 days on 3090)
 
 ## Data
 
