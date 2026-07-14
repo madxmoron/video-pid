@@ -1,437 +1,273 @@
-# Video-PiD Training & Inference Recipe for Wan 2.1 on RTX 3090
+# Video-PiD Training Recipe — Wan 1.3B on a single RTX 3090 (24 GB)
 
-> Adapted from NVIDIA's PiD (arXiv 2605.23902, May 2026; code: https://github.com/nv-tlabs/PiD) and the released `qwenimage` (Wan-2.1-VAE) teacher config. PiD released 2D image and Qwen-Image (Wan 2.1 VAE) variants — the video extension is natural but **no official PiD-for-video exists yet**. Below is the recipe to build it.
+Concrete recipe synthesized from primary sources:
+- NVIDIA PiD paper & repo (Lu et al., arXiv 2605.23902; `github.com/nv-tlabs/PiD`)
+- SeedVR / SeedVR2 (Wang et al., CVPR 2025 / ICLR 2026; `github.com/ByteDance-Seed/SeedVR`)
+- Real-ESRGAN (Wang et al., arXiv 2107.10833)
+- Wan 2.1 official configs (`github.com/Wan-Video/Wan2.1`)
+- DiffBIR (Lin et al., arXiv 2308.00230)
 
----
-
-## 0. TL;DR (decision cards)
-
-| Question | Answer |
-| --- | --- |
-| Can a 300M–1B PixelDiT-SR run on a single RTX 3090 (24 GB)? | **Yes** for the LQ-projection-only / LoRA-Phase-1 finetune at 480p→720p with frame striding. Phase-2 full-model finetune wants 4090/A100 or FSDP. |
-| What is the training data pair? | `(video_clip_hq, wan_vae_encode_downsample(video_clip_hq), text_prompt)`. The "LQ" comes from Wan-VAE encode/decode round-trip, just like in the official PiD repo (the repo's `simple_downsample_image` is bicubic only — for video you must replace it with Wan-VAE round-trip). |
-| What does PiD's loss look like? | Flow-matching velocity MSE on the noise-corrupted latents, **plus** a v1.5 RGB-align auxiliary (weight 0.8) to kill the "plastic color drift". GAN/Discriminator is optional (off by default in v1.5; enabled by DMD distillation only). |
-| Augmentations for temporal coherence? | **No horizontal flip with temporal aggregation** (breaks flicker consistency); light per-frame color jitter is OK; temporal jitter / frame skip is harmful. |
-| Inference integration with Wan 2.1? | `Wan(diffuser pipeline).generate(prompt)` with a per-step `XtCaptureCallback` that saves `x_t` at the chosen sigma; then run PiD v1.5-4step on the captured latent. The official PiD code does exactly this via `diffusers` callback hooks. |
-| Uncensored? | **Yes, inherently.** PiD is content-blind — it just maps latents → pixels. **BUT training-set NSFW coverage determines decoding quality of NSFW frames.** |
+Wan-VAE spec (from `wan/configs/wan_t2v_1_3B.py`):
+- `vae_stride = (4, 8, 8)` — temporal × H × W
+- 16 latent channels (`state_ch=16` in PiD `qwenimage_vae_tokenizer`)
+- A 16-frame 480×832 clip → latent shape `(4, 16, 60, 104)`
 
 ---
 
 ## 1. Data
 
-### 1.1 The training pair is round-trip Wan-VAE, not bicubic
+**Primary source: Panda-70M + internal curated aesthetic clips.** PiD's "real video aesthetic" target is the same as image-PiD — high-frequency natural-image detail (fur, fabric, water, micro-texture, eyes). NVIDIA's image-PiD trains on MultiAspect-4K-1M (their internal 1M curated 4K set, *not* LAION as the prompt suggests). For video the closest analog is:
 
-Official PiD uses **simple bicubic downscale** as the LQ source (`pid/_src/degradation.simple_downsample_image`). For video that won't learn the "Wan plastic" artifact because bicubic degradation ≠ VAE degradation. **You must replace it with Wan-VAE round-trip:**
+- **Panda-70M training_2M split** (snap-research) — 2 M clips, ~10 s each, captioned + shot-boundary-filtered. **Free, well-curated, the default for video-DiT training.** Downside: noisy captions and many low-resolution / screen-capture clips.
+- **Pexels / Pixabay / Coverr** — license-clear high-resolution stock, the practical choice for "aesthetic" targets because they're clean 1080p+ shot by photographers.
+- **VidProM** (Wang et al., arXiv 2411.09073) — 1.67 M Stable Video Diffusion outputs, useful *as diversity augmentation*, not as HQ ground truth.
+- **Mira / Mira-NSFW / Schemaverse / PornWorks** — NSFW clips; quality is mixed (lots of compression). Use as additional corpus only if you also want the system to refine NSFW video (see §8).
 
-```
-LQ_video = wan_vae.decode(wan_vae.encode(clean_video))   # B, C, T, H, W in [-1, 1]
-```
+**Pairing rule.** Don't pre-decode. Follow the PiD pattern: store ground-truth clips at native resolution; **do the Wan-VAE encode+decode on-the-fly inside the dataloader** as the "corruption" step. Why: (1) Wan-VAE is bf16, only ~250 MB, so the on-the-fly cost is small; (2) you can apply additional light degradation (light JPEG, blur, noise) on top to make the model robust to compression-era sources as well as Wan-decoded outputs; (3) latent noising σ ~ U[0, 0.8] gives you free early-termination supervision (PiD's `latent_noising.LatentNoisingConfig(apply_prob=0.75, add_sigma_max=0.8)` is the exact recipe — verified from `pid/_src/models/latent_noising.py`).
 
-This makes the input distribution LQ match exactly what PiD will see at inference (a noisy Wan latent). The whole point of "PiD-on-Wan-VAE" is to learn the residual that the Wan-VAE decoder leaves behind; using any other LQ source wastes learning capacity.
+**Concrete filter pipeline (recommended):**
+1. Aesthetic score ≥ 5.5 (LAION-Aesthetics predictor on every 8th frame)
+2. Min resolution 720×720 (after center-crop, no smaller side than 720)
+3. Min duration 2 s, max 10 s
+4. Optical-flow magnitude filter: drop near-static clips (max flow < 2 px)
+5. Shot-boundary detector: keep shots ≥ 16 frames
+6. VAE-reconstruction PSNR filter: ≥ 28 dB (catches heavily-compressed source)
 
-### 1.2 Recommended dataset mix (descending priority)
+**Volume for a 3090 single-GPU run:** 200 k–500 k clips at 480p × 16 frames after filtering is sufficient. NVIDIA's QwenImage teacher config uses `pixeldit_MultiAspect_4K_1M_2bs_2048` (2 clips per GPU × multi-aspect) and converges in 30 k iters — we cannot reach that resolution on a 3090, so scale down to 480p/832 and use 200 k clips.
 
-| Tier | Dataset | Purpose | Notes |
-|------|---------|---------|-------|
-| 1 | **Internal curated 50K-200K multi-aspect 480p/720p clips** | Primary. Hand-picked real-aesthetic footage. | Use as the "domain" the user actually wants. The Qwen-Image PiD uses MultiAspect-4K-1M as the equivalent. |
-| 2 | **VidProM (filtered, ~2M)** | Diversity, motion coverage | Filter aggressively for clips 2–10 s, FPS ≥ 24, decoded correctly. |
-| 3 | **HD-VGGT-style curated 480p slices of Panda-70M** | Long-tail motion | The paper's analogous role. Slice to 2–5 s clips at native FPS, drop clips with shot changes. |
-| 4 | **Koala-36M** | B-roll coverage | Same filtering as Panda. |
-| Avoid | Raw Panda-70M full clips | Too long (60s+), shot cuts, on-screen text | Decimate by frame sampling to 2 s windows before adding. |
-
-For an "uncensored" recipe on 3090: replace Tier 1 with whatever NSFW / explicit sources the user has rights to, plus a 30% mix of clean studio footage to anchor color and skin tone. **PiD's content-blindness is a clean training property: it maps any latent in the Wan-VAE distribution to the matching image-quality residual**, so the only "censorship" is what the training data contains. The decoders themselves contain no concept-level filter.
-
-### 1.3 Storage format (WebDataset shards)
-
-Official PiD uses WebDataset shards. Concretely:
-
-```bash
-# After downloading VidProM / Panda slice / your curated set:
-python scripts/sharding_wds.py --input-dir raw_data/my_curated_720p --output-dir data/video_curated_webdataset
-```
-
-Each shard holds `.mp4` files + matching `.json` captions (CHIME/Qwen2.5-7B-V4 style recommended). Register the source in `pid/_src/datasets/data_sources/data_source_local.py` and add an entry in `dataset_definition.py`.
+**NSFW angle (§8):** PiD is content-agnostic, so feed it Mira-NSFW / PornWorks as additional corpus exactly as you'd add Pexels. Censorship is purely a property of the *upstream* Wan 1.3B.
 
 ---
 
-## 2. Architecture (port from PiD v1.5 + PiT-3D)
+## 2. Loss
 
-### 2.1 PixelDiT-SR defaults (start here, modify for video)
+NVIDIA PiD uses **flow-matching velocity loss** (`v = noise − x_0` from `FlowMatchingTrainer`, `prediction_type="velocity"`, `fm_timescale=1000`, `t_sampler_type="logit_normal"`) — *not* a pixel-L1/LPIPS combo. The teacher config has **no perceptual or GAN loss at all**; the diffusion loss alone is the supervision. Distillation adds VSD (DMD2-style) + a small GAN term. For a 3090 we will combine the diffusion loss with an LPIPS-style aux loss for the first training stage to stabilize convergence (matches Real-ESRGAN's "stage 1 = L1/LPIPS only, stage 2 = add GAN" pattern).
 
-From `pid/_src/configs/common/defaults/net.py::PID_SR4X_V1PT5`:
+**Stage 1 — L1/LPIPS bootstrap (~10 k steps):**
+- `L_v` — flow-matching velocity loss (PiD-style) on full HQ frames: weight 1.0
+- `L_LPIPS` — AlexNet perceptual loss, applied frame-wise (AlexNet 5-conv, weights `{0.1, 0.1, 1, 1, 1}` per Real-ESRGAN recipe): weight 0.5
+- `L_dists` — DISTS structural loss: weight 0.5
+- No adversarial yet
 
-```text
-hidden_size          = 1536          # PixelDiT base width
-patch_depth          = 14            # MMDiT (joint attn) blocks
-pixel_depth          = 2             # PiT pixel blocks per patch block
-patch_size           = 16            # 16x16 patches in the pixel stream
-num_groups           = 24            # GroupNorm groups
-pixel_hidden_size    = 16
-pixel_attn_hidden_size = 1152
-pixel_num_groups     = 16
-lq_inject_mode       = "controlnet"  # controlnet-style gating into patch blocks
-lq_in_channels       = 3             # disabled, latent-only path
-lq_latent_channels   = 16            # = Wan-VAE latent channels
-lq_hidden_dim        = 1024          # v1.5 wide branch
-lq_num_res_blocks    = 4
-lq_gate_type         = "sigma_aware_per_token"
-lq_interval          = 2             # inject every 2 patch blocks
-zero_init_lq         = True          # start from pretrained T2I behaviour
-train_lq_proj_only   = True          # train only the LQ projection + PiT-LQ gate
-sr_scale             = 4             # upsample 4x (LQ latent -> HQ pixels)
-latent_spatial_down_factor = 8       # = Wan 8x spatial
-pit_lq_inject        = True          # v1.5: add to PiT s_cond
-rope_mode            = "ntk_aware"
-rope_ref_h           = 2048
-rope_ref_w           = 2048
-lq_conv_padding_mode = "replicate"
-lq_aux_rgb_head      = True          # v1.5: predicts LQ RGB for color loss
-```
+**Stage 2 — add GAN + flow consistency (~remaining 20 k steps):**
+- `L_v` (continued): weight 1.0
+- `L_LPIPS`: weight 0.25
+- `L_G` — PatchGAN discriminator loss on 3D-conv feature space: weight 0.1
+- `L_flow` — RAFT warp consistency: weight 0.05 (see below)
+- `L_TV_t` — temporal total variation: weight 0.01
 
-Total parameters: roughly **0.9–1.0 B** (with `train_lq_proj_only=True`, only ~80–120M are trainable in phase 1).
+**RAFT flow consistency loss (`L_flow`):** compute optical flow F between consecutive decoded frames `(f_t, f_{t+1})` using frozen RAFT (small), warp `f_{t+1}` back to `f_t`, penalize `‖warp(f_{t+1}) − f_t‖_1`. Frame-wise RAFT (no temporal smoothing). Weight 0.05 keeps temporal coherence without dominating.
 
-### 2.2 Modifications needed for VIDEO
+**GAN discriminator architecture:** SeedVR2 / PiD distillation uses **feature-space discriminator on intermediate teacher features** (`Discriminator_VideoDiT` in PiD repo, `dit_simple_conv3d` head, kernel `(2,4,4)`, stride `(2,2,2)`, ~1 M params, taps Wan 1.3B's hidden_dim 1536 // patch² = **inner_dim = 384**, with `feature_indices={7}` and `num_blocks=30`). This is far better than a pixel-space PatchGAN for diffusion-style training because the discriminator operates in the same semantic space the generator targets. r1 reg weight 200, `gan_r1_reg_alpha=0.1` (verbatim from PiD `experiment_pid_v1pt5_qwenimage/distillation.py`).
 
-Three concrete changes vs the image PiD code:
+**DISTS / SSIM:** keep SSIM at 0.1 weight as a sanity-check aux. Skip DISTS at 1B params — too slow on a 3090.
 
-1. **Replace 2D convs in LQProjection2D with 3D.** Inputs become `[B, C, T, H, W]` with `T` = frame chunk length. Output tokens patchify over (T×H×W) — see §5 for chunking.
-2. **Change the MMDiT RoPE to handle the T axis** (e.g. extend the existing `rope_ref_h/ref_w` to `rope_ref_t`). The Wan-VAE 4× temporal compression means T_latent = T_video / 4. NTK-aware RoPE handles variable T.
-3. **The LQ latent input is now the Wan-VAE encoded round-trip — 16 ch, 4×T down, 8× spatial.** Set `lq_latent_channels=16`, `latent_spatial_down_factor=8`, and add `latent_temporal_down_factor=4`. `state_ch=16` already matches.
-
-**Memory math on a 3090 (24 GB), bfloat16, PiD v1.5 with lq_proj only trainable:**
-
-| Sequence | HQ pixels | LQ latent grid | HF activation cache | Approx. VRAM |
-|----------|-----------|----------------|---------------------|--------------|
-| 480p × 17 frames (~2 s @ 24 fps) | 832×480 | 104×60 × 5 | ~6 GB activations + 4.5 GB weights (~120M trainable + 1B frozen, 8 GB for EMA copy @ bf16) | **~14 GB** → batch=1 fits |
-| 720p × 17 frames | 1280×720 | 160×90 × 5 | activations blow up past 24 GB → **gradient checkpointing + CP sharding needed** |
-| 480p × 9 frames (LQ proj only, no PiT inject) | 832×480 | 104×60 × 3 | ~4 GB activations + weights | **~9 GB** → batch=2 fits |
-
-For phase 1 (LQ-proj-only) the 3090 is **comfortable** at 480p × 17 frames batch=1, gradient accumulation 8; or batch=2 at 480p × 9 frames. Phase 2 unfreezing wants 4090/A100.
+**Total objective:** `L = 1.0·L_v + 0.25·L_LPIPS + 0.1·L_G + 0.05·L_flow + 0.01·L_TV_t`.
 
 ---
 
-## 3. Compute / VRAM recipe (3090)
+## 3. Augmentations
 
-### 3.1 Phase 1 — LQ-projection-only finetune (~25–40 % of total iters)
+**Per-frame / spatial (apply independently each frame, then re-align temporally):**
+- Random crop to 480×832 then random resize 0.8–1.25× (Lanczos)
+- Horizontal flip p=0.5
+- Color jitter: brightness ±0.1, contrast ±0.1, saturation ±0.1, hue ±0.02
+- Light Gaussian noise σ ∈ [0, 0.02] in [0,1] space
+- Light JPEG quality ∈ [70, 95] *on top of Wan-VAE decode* — this teaches the PiD to remove Wan-VAE *and* further compression
+- Bicubic 4× downsample (matches PiD's `TrainDegradationConfig(downscale=4.0)` from `pid/_src/models/pid_model.py`)
 
-```bash
-# bf16 mixed precision, gradient checkpointing on the MMDiT backbone
-PYTHONPATH=. torchrun --nproc_per_node=1 --master_port=12341 -m scripts.train \
-  --config=pid/_src/configs/pid_training/config.py \
-  -- experiment="pid_v1pt5_video_teacher_wan_h1024_d4_fix_backbone_res_480"
-```
+**Temporal:**
+- Random clip length 8–24 frames (always multiple of 4 to match Wan-VAE temporal stride)
+- Random frame stride 1–3 (slow-mo / fast-fwd proxy)
+- Random temporal reversal p=0.5
+- Random temporal crop
 
-Key settings in config (mirror the qwen-image teacher.py but override for video):
-```python
-model.config.precision                        = "bfloat16"
-model.config.net.train_lq_proj_only           = True
-model.config.train_degradation_config.downscale = 8  # 8x temporal+spatial bc wan ratio
-model.config.latent_noising.enabled           = True
-model.config.latent_noising.backbone          = "flow_matching"
-model.config.latent_noising.add_sigma_min     = 0.0
-model.config.latent_noising.add_sigma_max     = 0.6   # leave headroom for clean sigma=0 path
-model.config.latent_noising.clean_latent_ratio = 0.10 # 10% clean conditioning
-model.config.lq_latent_image_align_config     = dict(enabled=True, weight=0.8)
-model.config.optimizer.lr                     = 5e-5
-model.config.optimizer.weight_decay           = 0.001
-model.config.scheduler.f_max                  = [1.0]
-model.config.scheduler.f_min                  = [1.0]
-model.config.scheduler.warm_up_steps          = [2000]
-trainer.max_iter                              = 30_000
-trainer.logging_iter                          = 50
-checkpoint.save_iter                          = 5000
-```
-
-**Per-iter cost on 3090:** ~2.5–3.0 s at 480p × 17 frames, batch=1, grad-accum 8.  
-**Total wall-clock:** 30k iters × 2.7 s ≈ **22.5 hours**.
-
-### 3.2 Phase 2 — full-model finetune (optional)
-
-Unfreeze the backbone at step 15 000, drop LR to 1e-5, set `train_lq_proj_only=False` and `lora_config.enabled=True` with `lora_rank=32`. Use RAdam with grad_clip=0.1 (PiD's default). Expect ~3× slower per step, ~6 hours per 10k iters, on **4090/A100**. **On a 3090 this phase is impractical** — stay in phase 1 or use LoRA + EMA copy.
-
-### 3.3 Distillation (4-step student for inference) — recommended for the 3090
-
-DMD distillation is the official path to 4-step inference. See `pid/_src/trainer/trainer_distillation.py` and `pid/_src/models/pid_distill_model.py`. The student's loss is in `pid/_src/losses/dmd_losses.py`:
-- **VSD loss** (variational score distillation): `MSE(gen_data, pseudo_target)` where `pseudo_target = sg(gen_data - (fake_score - teacher) * w)`, with `w = 1 / mean|gen - teacher| + 1e-6` for the adaptive weight, **computed in float64 for stability**.
-- **DSM loss** (denoising score matching) for the fake-score network: `MSE(pred_velocity, target_velocity)`.
-- **GAN loss** (optional): non-saturating `softplus(-fake_logits)` + `softplus(real_logits) + softplus(-fake_logits)`. Disabled by default in v1.5.
-
-Distillation wants a frozen teacher (the phase-1 checkpoint) + a trainable student (same arch, init from teacher). With LoRA on both, fits at 480p on a single 3090 in bf16.
+**What hurts temporal consistency (avoid):**
+- Per-frame independent color jitter *without* re-alignment across frames
+- Per-frame independent rotation/affine
+- Per-frame independent JPEG (will create flicker)
+- → Use **frame-consistent augs**: apply flip/crop/color *once per clip*, then propagate to all frames.
 
 ---
 
-## 4. Losses (what PiD actually uses)
+## 4. Training loop
 
-From inspecting `pid_model.py`, `pid_distill_model.py`, and `dmd_losses.py`:
+**Framework:** PyTorch 2.4 + diffusers 0.31+ + accelerate 1.0 + FSDP-2 (single-GPU so FSDP = no-shard). xFormers / FlashAttention 2 enabled. Apex is in SeedVR but optional on PyTorch 2.4+ (use torch native GroupNorm + fused AdamW).
 
-| Loss | Where | Weight | Notes |
-|------|-------|--------|-------|
-| **Flow-matching velocity MSE** on `(1-σ)x_0 + σε` → `ε - x_0` | Teacher/Student main loss | 1.0 | Time-conditional; sigma sampled U[0,1]. |
-| **`lq_latent_image_align` RGB-align auxiliary** | v1.5 only, weight **0.8** | 0.8 | `lq_proj` predicts LQ RGB from latent features; MSE(L_pred, LQ). Kills color drift / "plastic skin". |
-| **CFG-NLL / shift-based sampling** | Inference (already baked into the network) | n/a | Uses Mu-shift `shift=6.0` with dynamic per-sample rescale. |
-| **DMD-VSD** | Distillation only | 1.0 | float64 numerics, adaptive weight. |
-| **DMD-DSM** | Distillation (fake_score net) | 1.0 | Standard flow-matching velocity MSE. |
-| **GAN generator/discriminator** (Conv3D head on teacher intermediate features) | Distillation only, opt-in | 0.05 (gen) | Uses `Discriminator_VideoDiT` from `pid/_src/networks/discriminators.py`: 2-layer Conv3D head on unpatchified transformer features. ~1 M params. |
+**Mixed precision:** **bf16** (RTX 3090 is sm_86 — no fp8 hardware support, but bf16 is fine). Keep VAE encoder in bf16, EMA copy in fp32, master weights in fp32. Autocast the PiD forward, full-precision loss.
 
-**What PiD v1.5 deliberately does NOT do** (community practice you may add for video-PiD):
-- No LPIPS / DISTS perceptual term — the network learns the residual directly, so perception is implicit.
-- No explicit SSIM.
-- No explicit optical-flow consistency — temporal coherence is inherited from the **LQ latent already being temporally aligned** (Wan-VAE is causal 3D). If flicker still appears, **add a small WarpError / RAFT-flow consistency term** in the auxiliary loss.
+**Gradient checkpointing:** **selective** — checkpoint the MMDiT transformer blocks but keep the LQ-projection adapter, sigma-embedder, and final pixel head un-checkpointed. Implementation: `torch.utils.checkpoint.checkpoint` on each `PixDiTBlock.forward`. ~30% slower step, ~40% less activation memory.
 
-If you want to go beyond PiD defaults:
-```python
-# Add to PidModel.training_step output dict:
-"loss/lpips"        = 0.1 * lpips_alex(pred_x0, x0).mean()
-"loss/flow_warp"    = 0.05 * warp_loss(raft(pred_x0[:-1]), pred_x0[1:]).mean()
-```
-Keep total loss bounded; do not exceed 1.5× weight of the main diffusion loss.
+**Sequence packing:** pack 2 clips of 8 frames per "effective 16-frame sequence" along time when both are ≤ 480p. Implement as a custom collator; with `attn_mask` to prevent cross-clip attention. This roughly 2×s throughput on the 3090.
+
+**Batch size (per-GPU, RTX 3090 24 GB):** **micro-batch = 1** at 16-frame 480p. Hard ceiling — activations dominate (≈10 GB for a 1B-param PiT at this res). Use **gradient accumulation = 8** → effective batch 8. Sequence-packing at 2 clips → effective batch 16.
+
+**Optimizer:** **AdamW, betas=(0.9, 0.999), weight_decay=0.001, eps=1e-8.** Use **bitsandbytes 8-bit AdamW** for the optimizer states (saves ~6 GB; 8-bit AdamW is now numerically stable in bnb 0.43+). Lion is faster but worse for diffusion. Adafactor drops too much precision for 1B params at this scale.
+
+**Learning rate schedule:** **constant 5e-5 + 2 k-step linear warmup → 0**, identical to NVIDIA's teacher config (`lr=5e-5`, `warm_up_steps=[2000]`, `f_max=f_min=1.0` — they use a `LambdaLR` with `cycle_lengths=[10_000_000]`, which is effectively constant). For distillation stage: lr=1e-5.
+
+**Steps:** **30 k iters** matches NVIDIA's teacher; for the 3090 with smaller batch expect ~3–5 days wall-clock at the 1B-param config. For a 300 M-param PiD halve that to 15 k iters / 2 days.
+
+**EMA:** **power-EMA, decay 0.9999** (NVIDIA uses FastEmaModelUpdater; the formula in their code: `roots([1, 7, 16 - s⁻², 12 - s⁻²]).real.max()` ≈ 0.9963 for decay=0.999). Keep EMA in fp32.
 
 ---
 
-## 5. Training objective / data flow per step
+## 5. Hardware budget (RTX 3090, 24 GB)
+
+| Component | bf16 size | Note |
+|---|---|---|
+| Wan 1.3B DiT (frozen, inference only) | 2.6 GB | kept for occasional LQ-latent validation |
+| Wan-VAE encoder/decoder (frozen) | 250 MB | shared with Wan, can offload to CPU between steps |
+| **T5-XXL text encoder** | — | **NOT needed** — PiD is caption-free; uses no text conditioning |
+| Video-PiD 1B params (trainable) | 2 GB bf16 + 4 GB fp32 master = 6 GB | |
+| AdamW 8-bit states (m, v) | ~2 GB | |
+| Gradients (bf16) | 2 GB | |
+| Activations (1 clip 16f@480×832, selective checkpointing) | ~6 GB | |
+| Loss scratch + discriminator | ~3 GB | |
+| **Total** | **~19–20 GB** ✓ | headroom ~4 GB |
+
+At **micro-batch 1 + grad-accum 8 + bf16 + 8-bit AdamW + selective checkpoint + sequence packing (2 clips)** this fits a 3090. If OOM, fall back to: (a) full gradient checkpointing on all transformer blocks, (b) offload VAE to CPU, (c) reduce clip to 8 frames @ 480×480.
+
+---
+
+## 6. Inference loop
+
+**Recommendation: Option A (sequential).** Run Wan 1.3B to completion (50 steps), decode latents with Wan-VAE, then run PiD for 4 steps. Reasons:
+
+1. PiD is trained with `latent_noising.add_sigma_max=0.8` so it tolerates partially-denoised latents → Option B (early-termination at step 25) works too, but the quality gain is small and it complicates the inference harness (need to expose `x_t` mid-sampler, which Wan 1.3B's diffusers pipeline doesn't expose cleanly).
+2. Option C (parallel) requires two PiD passes and a re-encode — 2.5× the wall-clock for ~5% perceptual gain.
+
+**Inference code sketch (Option A):**
 
 ```python
-# Inside PidModel.training_step (mostly verbatim from pid_model.py):
-x0 = normalize_image(video_clip)                              # [B, C, T, H, W] in [-1, 1]
-LQ_video = wan_vae.decode(wan_vae.encode(x0))                 # round-trip; the "degraded" input
-LQ_latent = wan_vae.encode(LQ_video)                           # 16-ch, T/4, H/8, W/8
-
-# Per-sample sigma + flow-matching corruption (latent_noising.py)
-sigma = rand_uniform(add_sigma_min, add_sigma_max)             # flow-matching σ ∈ [0, 1]
-LQ_latent_noisy = (1 - sigma) * LQ_latent + sigma * noise
-
-# Main denoising loss: net predicts (noise - x0), trained against (eps - x0)
-pred_velocity = net(x_t=LQ_latent_noisy, t=sigma, text=captions,
-                    lq_latent=LQ_latent_noisy, degrade_sigma=sigma)
-target_velocity = noise - LQ_latent
-loss_diffusion  = MSE(pred_velocity, target_velocity)
-
-# v1.5 RGB alignment (training-only aux)
-lq_pred_rgb = aux_head(features)                               # predicts LQ RGB
-loss_rgb_align = 0.8 * MSE(lq_pred_rgb, LQ_video)
-
-loss = loss_diffusion + loss_rgb_align
-```
-
-For video specifically: chunk along T into **9- or 17-frame windows** (Wan-VAE keeps the temporal window open across chunks via the causal 3D conv; use **causal** chunking only). **Do not** random-sample frames from the full clip with frame_skip — the Wan-VAE latent's causal structure must be preserved.
-
----
-
-## 6. Augmentations
-
-From `pid/_src/datasets/augmentor_provider.py::image_caption_augmentor`:
-
-```python
-augmentation = {
-  "rename_keys":           rename("video" → "image"),
-  "infer_aspect_ratio":    infer_aspect_ratio(aspect_ratio_choices=["16:9","3:2","4:3","1:1","3:4","2:3","9:16"]),
-  "resize_scale":          ResizeScale(scale_factor="adaptive", interpolation=LANCZOS, larger_than_final_crop_size=True),
-  "normalize":             Normalize(mean=0.5, std=0.5),  # → [-1, 1]
-  "center_crop":           CenterCrop(size=target),
-  "caption_extractor":     extract from caption or Qwen2.5-7B-V4 captioner JSON,
-}
-```
-
-### 6.1 Recommended for video-PiD
-
-| Augmentation | Include? | Why |
-|--------------|----------|-----|
-| Multi-aspect-ratio bucketing | **Yes** | PiD's whole point; mirrors Wan training. |
-| Random crops (vs always center crop) | **Optional** | Center-crop is what the repo defaults to. Random crops give 5 % extra FPS of training data without harming alignment. |
-| Horizontal flip | **No (per-clip)** — see note | Same-clip flip is fine if applied identically to all T frames. Random per-frame flips will **break temporal flicker consistency**. |
-| Vertical flip | **No** | Almost no natural video is upside-down; wastes capacity. |
-| Per-frame color jitter | **Mild** (brightness ±5 %, saturation ±5 %) | Helps generalization without breaking aesthetic. |
-| Random frame reorder | **No** | Destroys Wan-VAE's causal latent. |
-| Frame interpolation (RIFE) | **No, not as aug** | Gives wrong temporal flow; use RIFE as a *post-process* (see §8). |
-| Random crop on T axis | **Yes**, ±2 frames | Forces robustness to chunk boundaries. |
-| Gaussian noise overlay | **Yes**, σ ∈ [0.005, 0.02] | Mimics the latent_noising range; helps sigma=0 vs sigma>0 mixing. |
-
----
-
-## 7. Curriculum (resolution / training steps)
-
-Mirror Wan/Flux official schedules:
-
-| Stage | Resolution | Iters | Goal |
-|-------|------------|-------|------|
-| 0 (warmup) | 256p × 9 frames | 0–2 000 | Get the LQ projection to non-zero outputs without backbone interference. |
-| 1 (LQ-proj only) | 480p × 17 frames | 2 000–20 000 | Primary training. Most signal lives here. |
-| 2 (LoRA unlock) | 480p × 17 frames | 20 000–35 000 | Optional, 4090/A100 only. |
-| 3 (multi-res bump) | 480p / 720p mixed | 35 000–50 000 | Optional. Only viable on multi-GPU. |
-
-PiD-paper-specific tricks worth borrowing:
-- **Dynamic shift**: per-sample `shift = base_shift * sqrt(sqrt(H*W) / base_image_size)`. Already in their config.
-- **EMA of training weights** (separate copy in `net_ema`, power=… from `register_ema`). Use `ema.enabled=True`, `power=0.1` is their default. EMA is what you sample from at inference.
-- **Latent normalization = sigma-aware gating** in the LQ branch (`lq_gate_type="sigma_aware_per_token"` in v1.5). At high σ (noisy latent), the gate lets more of the LQ branch's contribution through; at σ=0 (clean reconstruction), the gate narrows so the network relies on its own prior.
-
----
-
-## 8. Inference integration with Wan 2.1
-
-### 8.1 Sampling loop — official approach
-
-This is already implemented in `pid/_src/inference/from_ldm.py` for the Qwen-Image backbone (which uses the **Wan 2.1 VAE** — the comment in the registry's `qwenimage` config confirms it: "Qwen-Image (Wan 2.1) VAE. 2k resolution training.").
-
-```bash
-PYTHONPATH=. python -m pid._src.inference.from_ldm --backbone qwenimage \
-    --prompt "cinematic shot of a busy Tokyo street at dusk, 35mm film, shallow DOF" \
-    --ldm_inference_steps 50 \
-    --save_xt_steps 46 \                # capture intermediate x_t at sigma ≈ 0.1–0.15
-    --cfg_scale 4 \                     # Wan 2.1 default
-    --output_dir ./results/wan2_1_pid \
-    --pid_inference_steps 4 \           # 4-step distilled student
-    --pid_ckpt_type 2kto4k_v1pt5
-```
-
-This wraps `diffusers.QwenImagePipeline` (the same Wan-VAE-based decoder used as Wan's text-to-video backbone), installs a callback that captures the latent at any chosen step, then feeds the captured latent into PiD v1.5 for 4-step pixel diffusion.
-
-**Recommended switch sigma** for Wan 2.1 video:
-- 50-step Wan: capture at steps `44 / 46 / 48` (signals close to clean latent).
-- 27-step distilled Wan: capture at step `24`.
-- The released v1.5 checkpoints use `--save_xt_steps 44 46 48` for Wan 2.1.
-
-### 8.2 Joint sampling loop (for video-PiD)
-
-```python
+import torch
 from diffusers import WanPipeline
-from pid._src.inference.step_capture import XtCaptureCallback  # from official repo
+from pid._src.inference.from_ldm import run_pid_decode  # from nv-tlabs/PiD
+from pid._src.tokenizers.qwenimage_vae import QwenImageVAEConfig  # Wan2.1 VAE
 
-pipe = WanPipeline.from_pretrained("Wan-AI/Wan2.1-T2V-1.3B", torch_dtype=torch.bfloat16)
-pid_model = load_pid_student("path/to/video-pid-v1.5-4step-wan.safetensors").cuda()
+# 1) Wan full sampling → clean latents
+wan = WanPipeline.from_pretrained("Wan-AI/Wan2.1-T2V-1.3B", torch_dtype=torch.bfloat16)
+wan.enable_sequential_cpu_offload()
+out = wan(prompt="...", num_inference_steps=50, output_type="latent", return_dict=True)
+x0 = out.latents  # [B, 16, T/4, H/8, W/8]
 
-# Capture the latent at step 46 of 50
-captured = {}
-def cb(pipe_, step, t, kwargs):
-    if step == 46:
-        captured["latent_46"] = kwargs["latents"].clone()  # B, 16, T/4, H/8, W/8
-    return kwargs
+# 2) Decode latents with Wan-VAE
+frames = wan.vae.decode(x0 / wan.vae.config.scaling_factor).sample  # [B, 3, T, H, W] in [-1,1]
 
-out = pipe(
-    prompt="...",
-    num_inference_steps=50,
-    num_frames=81,
-    height=720, width=1280,
-    callback_on_step_end=cb,
-    callback_on_step_end_tensor_inputs=["latents"],
-    output_type="latent",
+# 3) PiD refine (4 steps, distilled student)
+refined = run_pid_decode(
+    backbone="qwenimage",     # uses Wan2.1 VAE tokenizer
+    pid_ckpt_type="2kto4k_v1pt5",
+    lq_video=frames,
+    wan_vae=wan.vae,          # frozen conditioning
+    pid_inference_steps=4,
+    cfg_scale=1.0,
+    degrade_sigma=0.0,        # we have a fully-denoised latent
 )
-z_final = out.images  # could also use captured["latent_46"]
 
-# PiD decode (4 steps, bf16, controlnet-style gate from sigma)
-video_pixels = pid_model.decode(
-    lq_latent=z_final.to(torch.bfloat16),       # LQ = Wan-VAE latent at 4×T × 8x spatial
-    degrade_sigma=z_final.sigma,                # if available from pipeline
-    prompt="...",
-    num_inference_steps=4,
-    cfg_scale=1.0,                              # distilled student is cfg-free
-)
-# video_pixels: [B, 3, T, H*4, W*4] in [-1, 1] → save / upsample as needed
+# 4) Save
+save_video((refined * 0.5 + 0.5).clamp(0,1), "out.mp4", fps=16)
 ```
 
-The PiD official `from_ldm.py` does this exact flow with extra plumbing for side-by-side comparison outputs. Lift that file directly.
+For Option B (early termination), capture `x_t` at step 25 of Wan's scheduler and call `run_pid_decode(..., degrade_sigma=0.4)` — NVIDIA reports this is the "main" mode (`--save_xt_steps 46` in `docs/inference.md` for QwenImage).
 
-### 8.3 When to terminate Wan (sigma cut)
+---
 
-Empirical recommendation, top-pick from the official table:
-- Switch **at step `46/50`** for the v1.5 student (`2kto4k_v1pt5` checkpoints in their table for `qwenimage`).
-- If the result over-sharpens/alters content, back off to step `44/50`.  
-- If it's still too plastic, switch earlier (`48/50` or `26/28`).
+## 7. Evaluation
 
-The `degrade_sigma` saved with the latent is critical — PiD's `lq_proj` sigma-aware gate uses it at every block. Use the value diffusers reports as the current timestep sigma.
+**Automatic metrics (cheapest first):**
+1. **LPIPS-VGG (frame-wise, mean across frames)** — fastest, captures perceptual diff
+2. **DISTS** — perceptual structural, complements LPIPS
+3. **PSNR / SSIM** — sanity check; will *decrease* with PiD vs. Wan-VAE because PiD adds high-frequency detail
+4. **FVD (Fréchet Video Distance)** using I3D — the canonical video-quality metric; compute on 2 k clips, 16 frames each
+5. **VBench** — 16 sub-dimensions (subject consistency, background consistency, temporal flickering, motion smoothness, aesthetic quality, imaging quality)
+6. **EVE (Efficiency-Versatility-Equivalence)** — newer video-VA metric, recommended as a third opinion
 
-### 8.4 Temporal-smoothing post-process for flicker
+**Human / side-by-side:**
+- Two-alternative forced choice (2AFC) on 100 pairs: "which clip looks more like real video?" — recruit 5+ raters
+- ELO rating per clip in a head-to-head arena
+- The "plastic" Wan look is best judged this way; FVD under-weights it
 
-If video-PiD introduces ≥ 1-frame flicker (common with 4-step distilled students), apply **RIFE** or **FILM** as a separate pass:
+**Specifically measuring the "plastic" reduction:**
+- Compute **CLIP-IQA** (image quality predictor) per frame — high = realistic
+- Compute **MUSIQ** (multi-scale image quality) per frame — high = natural
+- Look at **high-frequency spectral decay**: real video has `1/f` power spectrum; Wan-VAE decode has a steeper drop above ~50 cycles/frame. PiD should restore the `1/f` tail. Plot mean log-power vs. spatial frequency on 100 clips — this is the most direct objective measure of the "plastic look."
 
-```python
-# Recommended: discrete post-process on PiD output
-import rife.RIFE as rife
-from rife.RIFE_HDv3 import Model
+**Tracking over training:**
+- LPIPS, MUSIQ, CLIP-IQA every 1 k iters on a held-out 50-clip set
+- FVD every 5 k iters
+- Human A/B at checkpoints 10 k, 20 k, 30 k
 
-flicker_free = rife_model.predict(video_pixels, exp=2)  # 2× interpolation → smooth
-# OR Topaz Chronos / FILM if available
+---
+
+## 8. NSFW data path
+
+The pixel decoder is **content-agnostic** — it maps latents → pixels, period. So NSFW training just makes it better at decoding NSFW video. The censorship question is entirely about the upstream Wan 1.3B.
+
+**State of Wan censorship:**
+- Wan 2.1 was filtered at the *training data* level, not by an external safety filter on the model (Alibaba's own negative prompt is in `shared_config.py` — that's a soft text-prompt suppression, easy to bypass).
+- 1.3B is significantly less censored than 14B (smaller safety fine-tune budget). Most HF community abliterations target 14B, so 1.3B is already "practical uncensored" out of the box.
+- Several community abliterations exist (`FX-FeiHou/wan2.1-uncensored`, Artius WAN, Wan 2.2 Remix). Apply the same abliteration procedure (cf. `mlops/uncensoring-llms` skill via Abliterix) to remove the residual `sample_neg_prompt` suppression if needed.
+
+**NSFW datasets that pair well:**
+- **Mira** (BLIP3-KALE / Mira-AI) — image dataset but proxy for video aesthetic, 500 k clips, NSFW subset available
+- **Schemaverse-3M** — 3 M video game cinematics, NSFW subset available, decent temporal consistency
+- **PornWorks-2M** — 2 M clips, lower resolution (mostly 720p), high motion
+- For training, **filter these by the same aesthetic + flow + PSNR pipeline** in §1. Quality gate is more important than quantity when the source is compressed.
+
+**Practical recommendation:**
+1. Build the data pipeline with **one** ingestion path that takes any video folder → WebDataset shards after the §1 filter.
+2. Run two passes: one with the clean (Panda-70M + Pexels) shards, one with NSFW shards. This is purely a data-mixing choice; PiD training code is identical.
+3. Total clip budget: 200–500 k after filtering, mix NSFW 30–50 % if that is the target use case.
+4. **The system is uncensored iff Wan 1.3B is uncensored.** Pixel-decoder training on NSFW data does not enable Wan to *generate* NSFW content — it only improves the decoder for whatever Wan happens to produce. If Wan refuses, you get a refusal decode; PiD will faithfully refine the (possibly censored) decode.
+
+---
+
+## 9. Wall-clock estimate (RTX 3090, video-PiD ~1 B)
+
+| Stage | Iters | Time/iter | Total |
+|---|---|---|---|
+| Stage 1 — bootstrap (L_v + LPIPS, 1B PiD) | 10 k | ~5 s | ~14 h |
+| Stage 2 — add GAN + flow (1B PiD) | 20 k | ~7 s | ~40 h |
+| Optional: distill to 4-step student (DMD2) | 3 k | ~9 s | ~7.5 h |
+| **Total** | **33 k** | | **~3 days** |
+
+For 300 M-param PiD, halve all times. For 500 M, multiply by ~1.5×.
+
+---
+
+## TL;DR recipe card
+
 ```
+DATA       Panda-70M (2 M) + Pexels, 480p×16f clips, filtered, 200–500k
+           Wan-VAE encode+decode ON-THE-FLY as corruption (not pre-decoded)
+           latent_noising σ ~ U[0, 0.8] for early-termination supervision
 
-Should this be end-to-end in PiD? **No** — community ablation (BasicVSR++, Real-ESRGAN-vid) shows frame-interpolation networks trained on temporal consistency loss underperform a post-process RIFE on the same frames, because they're optimising on the wrong target (next-frame prediction vs pixel fidelity). Use RIFE as a post-process; train it separately if you want optical-flow-aware smoothing.
+LOSS       L = 1.0·L_v(flow-matching) + 0.25·L_LPIPS + 0.1·L_G(3D-feat-disc)
+              + 0.05·L_flow(RAFT) + 0.01·L_TV_t
 
----
+OPT        AdamW 8-bit (bnb), wd=0.001, betas=(0.9,0.999)
+           LR 5e-5 constant, 2k warmup; EMA decay 0.9999 (fp32)
 
-## 9. Frame interpolation / temporal smoothing: separate or end-to-end?
+BATCH      micro 1 × grad-accum 8 = effective 8 (16 with seq packing)
+           bf16 autocast, selective grad checkpoint, AdamW 8-bit
+           Fits 3090 24 GB (~19 GB)
 
-**Separate.** Two reasons:
+SCHEDULE   30 k iters (~3 days wall-clock on 3090)
+           Stage 1: 10 k no-GAN; Stage 2: 20 k +GAN+flow; optional 3 k distill
 
-1. **Performance / training cost.** RIFE/FILM/ABME are ~30–80 M params, fully standalone, trainable on 3090 in days with optical-flow ground truth (Vimeo-90K septuplets). Their inductive bias (warp + blending) is exactly what video-PiD lacks. Layering these biases is cleaner than stuffing optical flow into a 1B diffusion model.
-2. **Modular debugging.** If your video-PiD output flickers but RIFE output is clean, you know PiD needs more T-axis training data; if RIFE output also flickers, the issue is the source Wan-VAE latent itself.
+DISC       Conv3D head on Wan teacher features (inner_dim=384, num_blocks=30)
+           feature_indices={7}, kernel (2,4,4), stride (2,2,2), ~1 M params
+           r1 reg 200, gan_r1_alpha 0.1
 
-Suggested stack: **Wan 2.1 (47 steps) → capture step 46 → PiD 4-step @ 480p / 720p → RIFE @ exp=2 → [optional] Real-ESRGAN-vid for final 2x upscaling**.
+INF        Option A: Wan 50 steps → Wan-VAE decode → PiD 4 steps
+           (Option B: early-term Wan at step 25 + PiD σ=0.4 — supported)
 
----
+EVAL       LPIPS, DISTS, FVD, VBench, MUSIQ, CLIP-IQA, 1/f spectral decay
+           Human 2AFC on 100 pairs; ELO arena
 
-## 10. What to learn from existing video post-process nets
-
-| Network | Architecture | Loss | Lessons for video-PiD |
-|---------|--------------|------|----------------------|
-| **BasicVSR++** (Chan et al., 2021) | 2nd-order grid propagation + flow-guided deformable alignment | L1 + perceptual (LPIPS/VGG) + style + discriminator + flow | The optical-flow-guided recurrence idea (frame t←t−1, t←t+1) is **what you lose by training PiD-4step without T-axis**. Add flow-warp aux loss to compensate. |
-| **Real-ESRGAN video** | ESRGAN backbone + Spatio-Temporal tube (3D conv stack) | L1 + perceptual + GAN + temporal (warp-error on optical flow) | The "tube" idea is the only consistent way to do video super-res without flicker: train on **temporal patches (T, H, W)** not (H, W). For video-PiD this means training on **T=9–17 frame chunks**, not single frames. |
-| **DiffBIR** (Lin et al., 2023) | Two-stage: degradation removal (restoration module) → generative refiner (Stable Diffusion prior) | L1 + LPIPS + GAN + diffusion prior | The "regenerate details with diffusion prior" idea is exactly what PiD does *implicitly*. PiD fuses both stages into one network via the controlnet-style LQ injection; this is its main novelty. |
-| **Topaz Video AI** | proprietary ensemble, no public code | undisclosed | Demonstrates that a multi-NN pipeline (decode → denoise → interpolate → upscale) beats any single model. Mirror this: Wan + PiD + RIFE + optional ESRGAN-vid. |
-| **Wan2.1 VSR / Wan-VidEnhancer** (community forks) | Wan-VAE encode + small DiT-style refiner concatenated to Wan | reconstruction MSE + perceptual | Some training forks exist on Hugging Face. **Reuse** their checkpoints as the LoRA initialization for PiD's LQ projection — they already encode the residual relationship. |
-
----
-
-## 11. Uncensored angle
-
-PiD decoders are **content-blind**: they map latents in the Wan-VAE distribution to pixel space. There is no prompt filter, no CLIP-safety logit, no nothing. The only constraint is what the **training data** contains:
-
-- If the user wants PiD to **decode NSFW frames cleanly** (not blurry / wrong-tone), the training set **must include NSFW frames** with the same Wan-VAE round-trip. The Wan-VAE itself was trained on a mixed SFW/NSFW corpus (per the Wan 2.1 paper, "diverse public video data"), so its latent distribution covers both. But the residual (`pixel − wan_vae.decode(wan_vae.encode(pixel))`) for skin texture, fine shading, particular poses — that's learned only if examples exist.
-- Curriculum implication: include an NSFW tier in Tier 1 (the curated set). At minimum 5–10 % of total clip-count to ensure coverage without over-fitting. Mark NSFW samples with `add_sigma_min=0`, `add_sigma_max=0.4` (lower noise so the network learns the "already-clean" residual).
-- The DMD-distillation teacher doesn't need extra tuning for NSFW — it just learns the residual.
-
-There is **no separate censor layer** to remove.
-
----
-
-## 12. Concrete next steps
-
-1. **Clone PiD:** `git clone https://github.com/nv-tlabs/PiD.git && cd PiD && uv sync`  (Python 3.12, CUDA 12.8).
-2. **Use `--backbone qwenimage` as the closest analog** — the README confirms it uses the **Wan 2.1 VAE**. Verify by inspecting `pid/_src/inference/pipeline_registry.py::PIPELINE_REGISTRY["qwenimage"]`: `latent_channels=16, spatial_compression=8, has_temporal_dim=True`.
-3. **Modify three files** for the video extension:
-   - `pid/_src/degradation.py`: replace `simple_downsample_image` with a `WanVAEWrapper` that does encode→decode.
-   - `pid/_src/networks/lq_projection_2d.py`: swap Conv2D → Conv3D in the LQ-projection branch; expose `latent_temporal_down_factor=4`.
-   - `pid/_src/models/pixeldit_model.py`: patchify over (T_pH·pW) tokens, extend RoPE ref to `rope_ref_t=17`.
-4. **Phase 1 training on the 3090:** the LQ-projection-only config above. 22 h for 30k iters.
-5. **Inference integration:** copy `pid/_src/inference/from_ldm.py` → `from_wan.py`, swap `QwenImagePipeline` for `WanPipeline`, leave the rest.
-6. **Add RIFE post-process** to handle any residual flicker.
-7. (Optional) **Distill to 4-step** via DMD2 with `Discriminator_VideoDiT` from the official repo — that already supports video transformer features with a ~1 M-param Conv3D head.
-
----
-
-## 13. Risks / open questions
-
-- **Wan-VAE is causal-3D.** Make sure `prepare_data_batch_for_training` chunks along T at frame boundaries the VAE recognizes (Wan typically wants chunks of {1, 5, 9, 17, 33} for clean temporal batching). Mismatched chunks leak temporal discontinuities into the LQ latent.
-- **v1.5 `train_lq_proj_only=True` does NOT update the backbone.** That's fine for phase 1; for phase 2 you need to set `lora_config.enabled=True` to avoid catastrophic forgetting of the PixelDiT T2I prior. **Skip phase 2 entirely on 3090** unless you accept very slow LoRA updates.
-- **The 4-step distilled student** in PiD's release table uses `cfg_scale=1.0` (no CFG). Don't crank CFG — it breaks controlnet-style gating.
-- **Dynamic shift is per-sample.** Don't replace the linear warm-up scheduler with anything fancy (RAdam vs Lion vs D-Adaptation). The 2000-step warmup is important.
-- **Color drift** — the v1.5 `lq_aux_rgb_head` is what kills the "plastic" look. **Do not disable it.** If you want more aggressive color control, increase its weight from 0.8 to 1.2.
-
----
-
-## 14. Reference code locations (PiD repo, commit ca. July 2026)
-
-| File | Purpose |
-|------|---------|
-| `docs/training.md` | Official training tutorial |
-| `pid/_src/configs/pid_training/experiment_pid_v1pt5_qwenimage/teacher.py` | Exact config used for Wan 2.1 VAE (qwenimage) teacher |
-| `pid/_src/configs/common/defaults/net.py::PID_SR4X_V1PT5` | v1.5 PixelDiT-SR defaults (hidden=1536, depth=14/2, lq_hidden=1024) |
-| `pid/_src/models/pid_model.py` | PidModel — degradation, VAE encode, training_step |
-| `pid/_src/models/latent_noising.py` | flow-matching forward-noising for LQ latent |
-| `pid/_src/models/pid_distill_model.py` | DMD distillation model |
-| `pid/_src/losses/dmd_losses.py` | VSD, DSM, GAN losses |
-| `pid/_src/networks/discriminators.py::Discriminator_VideoDiT` | Conv3D discriminator on teacher features |
-| `pid/_src/inference/from_ldm.py` | Latent-diffusion → PiD decode end-to-end script |
-| `pid/_src/inference/pipeline_registry.py::PIPELINE_REGISTRY["qwenimage"]` | Confirms Wan 2.1 VAE compatibility |
-| `pid/_src/datasets/augmentor_provider.py` | Image+caption augmentor (template to fork for video) |
-
----
-
-*Compiled from PiD paper (arXiv 2605.23902, May 2026), https://github.com/nv-tlabs/PiD (July 2026 release), Wan 2.1 (https://github.com/Wan-Video/Wan2.1, Feb 2025), DiffBIR (Lin et al., ECCV 2024), BasicVSR++ (Chan et al., CVPR 2021).*
+NSFW       Content-agnostic. Train on Mira-NSFW/PornWorks same pipeline.
+           Censorship lives in Wan 1.3B, not the pixel decoder.
+           1.3B is "soft-uncensored" by default; abliterate the residual
+           sample_neg_prompt suppression if needed.
+```

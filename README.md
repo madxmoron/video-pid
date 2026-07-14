@@ -49,13 +49,13 @@ python scripts/generate_baseline.py --prompt "a cat walking through a garden" --
 python scripts/generate_with_pid.py --prompt "a cat walking through a garden" --output with_pid.mp4
 ```
 
-Requirements: PyTorch 2.7+, diffusers 0.39+, transformers, accelerate. ~20GB VRAM for Wan 1.3B + T5-XXL + video-PiD inference.
+Requirements: PyTorch 2.7+, diffusers 0.39+, transformers, accelerate. ~9GB VRAM for Wan 1.3B (T5 on CPU) + video-PiD inference on 3090.
 
 ## Architecture (TL;DR)
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full spec. One-paragraph version:
 
-A 3D DiT-B/2 (or L/2) with 3D RoPE on (T, H, W) positions, adaLN timestep conditioning, full self-attention across all video tokens. Operates on Wan-VAE-decoded pixel frames at patch 1×4×4. Cross-attends to the original Wan latent (4×8×8 = 240 tokens for 16 frames) for conditioning. Outputs a residual added to the input. 4-step EDM sampler at inference.
+Port of NVIDIA PiD v1.5 (qwenimage) from 2D image to 3D video. NVIDIA trained PiD on a VAE byte-identical to Wan 2.1's (16ch, 8× spatial, identical mean/std). We inflate the 9 Conv2d layers in the LQ projection to Conv3d, add a temporal attention block, and fine-tune on video clips. Subclass `WanPipeline` and insert the video-PiD hook between `vae.decode()` and `video_processor.postprocess_video()` (lines 667-668 in diffusers). 4-step EDM sampler. Fits RTX 3090 with T5 on CPU.
 
 ## Training
 
