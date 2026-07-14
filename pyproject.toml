@@ -53,7 +53,7 @@ dev = [
 Homepage = "https://github.com/madxmoron/video-pid"
 Repository = "https://github.com/madxmoron/video-pid"
 Issues = "https://github.com/madxmoron/video-pid/issues"
-HuggingFace = "https://huggingface.co/madxmoron/video-pid"
+HuggingFace = "https://huggingface.co/PeppX/video-pid"
 
 [tool.setuptools.packages.find]
 include = ["video_pid*"]

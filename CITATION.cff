@@ -9,7 +9,7 @@ authors:
   - family-names: madxmoron
     given-names: madxmoron
 repository-code: "https://github.com/madxmoron/video-pid"
-url: "https://huggingface.co/madxmoron/video-pid"
+url: "https://huggingface.co/PeppX/video-pid"
 keywords:
   - diffusion
   - video
